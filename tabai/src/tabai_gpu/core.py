@@ -73,15 +73,36 @@ class GPUBigInt:
         return self._trim(res)
 
     def sub(self, a_gpu, b_gpu):
+        cmp = self._compare(a_gpu, b_gpu)
+        if cmp == 0:
+            return cp.array([0], dtype=cp.uint32), 1
+        if cmp < 0:
+            return self._sub_unsigned(b_gpu, a_gpu), -1
+        return self._sub_unsigned(a_gpu, b_gpu), 1
+
+    def _sub_unsigned(self, a_gpu, b_gpu):
         states, base_res = self._align_and_get_states(a_gpu, b_gpu, 'sub')
         resolved = self._resolve_carries_gpu(states)
-        
+
         actual_borrows = cp.zeros(len(states), dtype=cp.uint32)
         if len(states) > 1:
             actual_borrows[1:] = (resolved[:-1] == 2).astype(cp.uint32)
-        
+
         res = base_res - actual_borrows
         return self._trim(res)
+
+    def _compare(self, a_gpu, b_gpu):
+        n = max(len(a_gpu), len(b_gpu))
+        a = cp.zeros(n, dtype=cp.uint32)
+        b = cp.zeros(n, dtype=cp.uint32)
+        a[:len(a_gpu)] = a_gpu
+        b[:len(b_gpu)] = b_gpu
+
+        diff_mask = a != b
+        if not cp.any(diff_mask):
+            return 0
+        msb_idx = int(cp.max(cp.nonzero(diff_mask)[0]))
+        return 1 if int(a[msb_idx]) > int(b[msb_idx]) else -1
 
     def mul(self, a_gpu, b_gpu):
         """GPU FFT乗算"""

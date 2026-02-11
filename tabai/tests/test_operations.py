@@ -29,10 +29,43 @@ def test_add_carry_chain(calc):
     res = calc.add(int_to_gpu(a), int_to_gpu(b))
     assert gpu_to_int(res) == (1 << 100000)
 
+def test_sub_1_1(calc):
+    res, sign = calc.sub(int_to_gpu(1), int_to_gpu(1))
+    assert sign * gpu_to_int(res) == 0
+
 def test_sub_basic(calc):
     a, b = 20**100, 10**100
-    res = calc.sub(int_to_gpu(a), int_to_gpu(b))
-    assert gpu_to_int(res) == a - b
+    res, sign = calc.sub(int_to_gpu(a), int_to_gpu(b))
+    assert sign * gpu_to_int(res) == a - b
+
+def test_sub_small_numbers(calc):
+    for a in range(0, 100):
+        for b in range(0, 100):
+            res, sign = calc.sub(int_to_gpu(a), int_to_gpu(b))
+            assert sign * gpu_to_int(res) == a - b
+
+def test_sub_borrow_chain(calc):
+    a = (1 << 100000)
+    b = 1
+    res, sign = calc.sub(int_to_gpu(a), int_to_gpu(b))
+    assert sign * gpu_to_int(res) == a - b
+
+def test_sub_negative(calc):
+    a, b = 10**100, 20**100
+    res, sign = calc.sub(int_to_gpu(a), int_to_gpu(b))
+    assert sign == -1
+    assert sign * gpu_to_int(res) == a - b
+
+def test_sub_zero(calc):
+    a = 10**100
+    res, sign = calc.sub(int_to_gpu(a), int_to_gpu(0))
+    assert sign * gpu_to_int(res) == a
+
+    res, sign = calc.sub(int_to_gpu(0), int_to_gpu(a))
+    assert sign * gpu_to_int(res) == -a
+
+    res, sign = calc.sub(int_to_gpu(0), int_to_gpu(0))
+    assert sign * gpu_to_int(res) == 0
 
 def test_mul_1_1(calc):
     res = calc.mul(int_to_gpu(1), int_to_gpu(1))
@@ -71,5 +104,6 @@ def test_mul_carry_chain(calc):
 ], ids=["1000bit", "100000bit"])
 def test_large_ops(calc, a, b):
     assert gpu_to_int(calc.add(int_to_gpu(a), int_to_gpu(b))) == a + b
-    assert gpu_to_int(calc.sub(int_to_gpu(a), int_to_gpu(b))) == a - b
+    sub_res, sub_sign = calc.sub(int_to_gpu(a), int_to_gpu(b))
+    assert sub_sign * gpu_to_int(sub_res) == a - b
     assert gpu_to_int(calc.mul(int_to_gpu(a), int_to_gpu(b))) == a * b
