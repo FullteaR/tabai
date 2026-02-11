@@ -23,6 +23,26 @@ void parallel_carry_scan(int* states, int n, int step) {
 }
 ''', 'parallel_carry_scan')
 
+_mul_kernel = cp.RawKernel(r'''
+extern "C" __global__
+void mul_partial_products(const unsigned int* a, int n_a,
+                          const unsigned int* b, int n_b,
+                          unsigned long long* result, int n_out) {
+    int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= n_out) return;
+
+    unsigned long long sum = 0;
+    int i_start = (k - n_b + 1) > 0 ? (k - n_b + 1) : 0;
+    int i_end = k < (n_a - 1) ? k : (n_a - 1);
+
+    for (int i = i_start; i <= i_end; i++) {
+        sum += (unsigned long long)a[i] * (unsigned long long)b[k - i];
+    }
+
+    result[k] = sum;
+}
+''', 'mul_partial_products')
+
 class GPUBigInt:
     def __init__(self, max_bits=1000000):
         self.max_bits = max_bits
@@ -82,6 +102,29 @@ class GPUBigInt:
         
         res = base_res - actual_borrows
         return self._trim(res)
+
+    def mul(self, a_gpu, b_gpu):
+        """GPU並列乗算"""
+        n_a = len(a_gpu)
+        n_b = len(b_gpu)
+        n_out = n_a + n_b
+
+        result = cp.zeros(n_out, dtype=cp.uint64)
+
+        threads_per_block = 256
+        blocks = (n_out + threads_per_block - 1) // threads_per_block
+        _mul_kernel((blocks,), (threads_per_block,),
+                    (a_gpu, n_a, b_gpu, n_b, result, n_out))
+        cp.cuda.runtime.deviceSynchronize()
+
+        while True:
+            carries = result >> cp.uint64(32)
+            result = result & cp.uint64(0xFFFFFFFF)
+            if cp.all(carries == 0):
+                break
+            result[1:] += carries[:-1]
+
+        return self._trim(result.astype(cp.uint32))
 
     def _trim(self, gpu_arr):
         nonzero = cp.where(gpu_arr != 0)[0]

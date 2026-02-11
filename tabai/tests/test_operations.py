@@ -29,6 +29,31 @@ def test_sub_basic(calc):
     res = calc.sub(int_to_gpu(a), int_to_gpu(b))
     assert gpu_to_int(res) == a - b
 
+def test_mul_1_1(calc):
+    res = calc.mul(int_to_gpu(1), int_to_gpu(1))
+    assert gpu_to_int(res) == 1
+
+def test_mul_basic(calc):
+    a, b = 10**100, 20**100
+    res = calc.mul(int_to_gpu(a), int_to_gpu(b))
+    assert gpu_to_int(res) == a * b
+
+def test_mul_by_zero(calc):
+    a = 10**100
+    res = calc.mul(int_to_gpu(a), int_to_gpu(0))
+    assert gpu_to_int(res) == 0
+
+def test_mul_by_one(calc):
+    a = 10**100
+    res = calc.mul(int_to_gpu(a), int_to_gpu(1))
+    assert gpu_to_int(res) == a
+
+def test_mul_carry_chain(calc):
+    a = (1 << 100000) - 1
+    b = (1 << 100000) - 1
+    res = calc.mul(int_to_gpu(a), int_to_gpu(b))
+    assert gpu_to_int(res) == a * b
+
 @pytest.mark.parametrize("bits", [1000, 100000])
 def test_random_ops(calc, bits):
     a = random.getrandbits(bits)
@@ -38,3 +63,5 @@ def test_random_ops(calc, bits):
     # 減算 (a > b に調整)
     if a < b: a, b = b, a
     assert gpu_to_int(calc.sub(int_to_gpu(a), int_to_gpu(b))) == a - b
+    # 乗算
+    assert gpu_to_int(calc.mul(int_to_gpu(a), int_to_gpu(b))) == a * b
