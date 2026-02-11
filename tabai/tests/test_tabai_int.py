@@ -67,6 +67,58 @@ def test_from_int_and_to_cpu_roundtrip():
         assert TabaiInt(v).to_cpu() == v
 
 
+def test_floordiv_basic():
+    a, b = 7, 3
+    assert (TabaiInt(a) // TabaiInt(b)).to_cpu() == 2
+
+
+def test_mod_basic():
+    a, b = 7, 3
+    assert (TabaiInt(a) % TabaiInt(b)).to_cpu() == 1
+
+
+def test_divmod_basic():
+    a, b = 7, 3
+    q, r = divmod(TabaiInt(a), TabaiInt(b))
+    assert q.to_cpu() == 2
+    assert r.to_cpu() == 1
+
+
+def test_div_exact():
+    a, b = 6, 3
+    assert (TabaiInt(a) // TabaiInt(b)).to_cpu() == 2
+    assert (TabaiInt(a) % TabaiInt(b)).to_cpu() == 0
+
+
+def test_div_small_numbers():
+    for a in range(0, 100):
+        for b in range(1, 100):
+            assert (TabaiInt(a) // TabaiInt(b)).to_cpu() == a // b
+            assert (TabaiInt(a) % TabaiInt(b)).to_cpu() == a % b
+
+
+def test_div_zero_dividend():
+    assert (TabaiInt(0) // TabaiInt(5)).to_cpu() == 0
+    assert (TabaiInt(0) % TabaiInt(5)).to_cpu() == 0
+
+
+def test_div_by_one():
+    a = 10**100
+    assert (TabaiInt(a) // TabaiInt(1)).to_cpu() == a
+    assert (TabaiInt(a) % TabaiInt(1)).to_cpu() == 0
+
+
+def test_div_by_zero():
+    with pytest.raises(ZeroDivisionError):
+        TabaiInt(7) // TabaiInt(0)
+
+
+def test_div_large():
+    a, b = 20**100, 10**100
+    assert (TabaiInt(a) // TabaiInt(b)).to_cpu() == a // b
+    assert (TabaiInt(a) % TabaiInt(b)).to_cpu() == a % b
+
+
 @pytest.mark.parametrize("a,b", [
     ((1 << 1000) - (1 << 500) + 1, (1 << 999) + (1 << 333) - 1),
     ((1 << 100000) - (1 << 50000) + 1, (1 << 99999) + (1 << 33333) - 1),
@@ -75,3 +127,5 @@ def test_large_ops(a, b):
     assert (TabaiInt(a) + TabaiInt(b)).to_cpu() == a + b
     assert (TabaiInt(a) - TabaiInt(b)).to_cpu() == a - b
     assert (TabaiInt(a) * TabaiInt(b)).to_cpu() == a * b
+    assert (TabaiInt(a) // TabaiInt(b)).to_cpu() == a // b
+    assert (TabaiInt(a) % TabaiInt(b)).to_cpu() == a % b
