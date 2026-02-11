@@ -56,7 +56,7 @@ def test_mul_carry_chain(calc):
 @pytest.mark.parametrize("a,b", [
     ((1 << 1000) - (1 << 500) + 1, (1 << 999) + (1 << 333) - 1),
     ((1 << 100000) - (1 << 50000) + 1, (1 << 99999) + (1 << 33333) - 1),
-])
+], ids=["1000bit", "100000bit"])
 def test_large_ops(calc, a, b):
     assert gpu_to_int(calc.add(int_to_gpu(a), int_to_gpu(b))) == a + b
     assert gpu_to_int(calc.sub(int_to_gpu(a), int_to_gpu(b))) == a - b
