@@ -17,6 +17,12 @@ def test_add_basic(calc):
     res = calc.add(int_to_gpu(a), int_to_gpu(b))
     assert gpu_to_int(res) == a + b
 
+def test_add_small_numbers(calc):
+    for a in range(0,10000):
+        for b in range(0,10000):
+            res = calc.add(int_to_gpu(a), int_to_gpu(b))
+            assert gpu_to_int(res) == a + b
+
 def test_add_carry_chain(calc):
     a = (1 << 100000) - 1
     b = 1
@@ -46,6 +52,12 @@ def test_mul_by_one(calc):
     a = 10**100
     res = calc.mul(int_to_gpu(a), int_to_gpu(1))
     assert gpu_to_int(res) == a
+
+def test_mul_small_numbers(calc):
+    for a in range(0,10000):
+        for b in range(0,10000):
+            res = calc.mul(int_to_gpu(a), int_to_gpu(b))
+            assert gpu_to_int(res) == a * b
 
 def test_mul_carry_chain(calc):
     a = (1 << 100000) - 1
