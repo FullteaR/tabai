@@ -83,6 +83,55 @@ class GPUBigInt:
         res = base_res - actual_borrows
         return self._trim(res)
 
+    def mul(self, a_gpu, b_gpu):
+        """GPU FFT乗算"""
+        a16 = self._split_to_uint16(a_gpu)
+        b16 = self._split_to_uint16(b_gpu)
+
+        n_a = len(a16)
+        n_b = len(b16)
+        n_conv = n_a + n_b - 1
+        n_fft = 1
+        while n_fft < n_conv:
+            n_fft <<= 1
+
+        a_f = cp.zeros(n_fft, dtype=cp.float64)
+        b_f = cp.zeros(n_fft, dtype=cp.float64)
+        a_f[:n_a] = a16.astype(cp.float64)
+        b_f[:n_b] = b16.astype(cp.float64)
+
+        fc = cp.fft.rfft(a_f) * cp.fft.rfft(b_f)
+        c = cp.fft.irfft(fc, n=n_fft)
+
+        result = cp.zeros(n_fft + 1, dtype=cp.int64)
+        result[:n_fft] = cp.rint(c).astype(cp.int64)
+
+        while True:
+            carries = result >> cp.int64(16)
+            result = result & cp.int64(0xFFFF)
+            if cp.all(carries == 0):
+                break
+            result[1:] += carries[:-1]
+
+        return self._trim(self._combine_from_uint16(result.astype(cp.uint16)))
+
+    def _split_to_uint16(self, arr):
+        """uint32 limb配列をuint16 half-limb配列に分割 (little-endian)"""
+        low = (arr & cp.uint32(0xFFFF)).astype(cp.uint16)
+        high = (arr >> cp.uint32(16)).astype(cp.uint16)
+        result = cp.empty(len(arr) * 2, dtype=cp.uint16)
+        result[0::2] = low
+        result[1::2] = high
+        return result
+
+    def _combine_from_uint16(self, arr):
+        """uint16 half-limb配列をuint32 limb配列に結合"""
+        if len(arr) % 2 == 1:
+            arr = cp.concatenate([arr, cp.array([0], dtype=cp.uint16)])
+        low = arr[0::2].astype(cp.uint32)
+        high = arr[1::2].astype(cp.uint32)
+        return low | (high << cp.uint32(16))
+
     def _trim(self, gpu_arr):
         nonzero = cp.where(gpu_arr != 0)[0]
         if nonzero.size == 0:
