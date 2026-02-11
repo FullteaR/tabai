@@ -137,3 +137,79 @@ class GPUBigInt:
         if nonzero.size == 0:
             return cp.array([0], dtype=cp.uint32)
         return gpu_arr[:int(nonzero[-1]) + 1]
+
+    def _compare(self, a_gpu, b_gpu):
+        n = max(len(a_gpu), len(b_gpu))
+        a = cp.zeros(n, dtype=cp.uint32)
+        b = cp.zeros(n, dtype=cp.uint32)
+        a[:len(a_gpu)] = a_gpu
+        b[:len(b_gpu)] = b_gpu
+        diff = a.astype(cp.int64) - b.astype(cp.int64)
+        nonzero_idx = cp.nonzero(diff)[0]
+        if len(nonzero_idx) == 0:
+            return 0
+        top_idx = int(nonzero_idx[-1])
+        return 1 if int(diff[top_idx]) > 0 else -1
+
+    def _bit_length(self, a_gpu):
+        a = self._trim(a_gpu)
+        if len(a) == 1 and int(a[0]) == 0:
+            return 0
+        return (len(a) - 1) * 32 + int(a[-1]).bit_length()
+
+    def _shift_left(self, a_gpu, bits):
+        if bits == 0:
+            return a_gpu.copy()
+        limb_shift = bits // 32
+        bit_shift = bits % 32
+        n = len(a_gpu) + limb_shift + (1 if bit_shift > 0 else 0)
+        result = cp.zeros(n, dtype=cp.uint32)
+        if bit_shift == 0:
+            result[limb_shift:limb_shift + len(a_gpu)] = a_gpu
+        else:
+            ext = a_gpu.astype(cp.uint64) << cp.uint64(bit_shift)
+            result[limb_shift:limb_shift + len(a_gpu)] = (ext & 0xFFFFFFFF).astype(cp.uint32)
+            result[limb_shift + 1:limb_shift + 1 + len(a_gpu)] += (ext >> 32).astype(cp.uint32)
+        return self._trim(result)
+
+    def _shift_right_one(self, a_gpu):
+        result = a_gpu >> cp.uint32(1)
+        if len(a_gpu) > 1:
+            carry_bits = (a_gpu[1:] & cp.uint32(1)) << cp.uint32(31)
+            result[:-1] |= carry_bits
+        return self._trim(result)
+
+    def divmod(self, a_gpu, b_gpu):
+        b = self._trim(b_gpu)
+        a = self._trim(a_gpu)
+        if len(b) == 1 and int(b[0]) == 0:
+            raise ZeroDivisionError("division by zero")
+        cmp = self._compare(a, b)
+        if cmp < 0:
+            return cp.array([0], dtype=cp.uint32), a.copy()
+        if cmp == 0:
+            return cp.array([1], dtype=cp.uint32), cp.array([0], dtype=cp.uint32)
+        a_bits = self._bit_length(a)
+        b_bits = self._bit_length(b)
+        shift_max = a_bits - b_bits
+        q_limbs = (shift_max + 32) // 32
+        quotient = cp.zeros(q_limbs, dtype=cp.uint32)
+        remainder = a.copy()
+        shifted_b = self._shift_left(b, shift_max)
+        for i in range(shift_max, -1, -1):
+            if self._compare(remainder, shifted_b) >= 0:
+                remainder = self.sub(remainder, shifted_b)
+                limb_idx = i // 32
+                bit_idx = i % 32
+                quotient[limb_idx] = cp.uint32(int(quotient[limb_idx]) | (1 << bit_idx))
+            if i > 0:
+                shifted_b = self._shift_right_one(shifted_b)
+        return self._trim(quotient), self._trim(remainder)
+
+    def floordiv(self, a_gpu, b_gpu):
+        q, _ = self.divmod(a_gpu, b_gpu)
+        return q
+
+    def mod(self, a_gpu, b_gpu):
+        _, r = self.divmod(a_gpu, b_gpu)
+        return r

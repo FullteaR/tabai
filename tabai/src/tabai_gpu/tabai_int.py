@@ -27,5 +27,15 @@ class TabaiInt:
     def __mul__(self, other: TabaiInt) -> TabaiInt:
         return TabaiInt(_shared_gpu_big_int.mul(self._gpu, other._gpu))
 
+    def __floordiv__(self, other: TabaiInt) -> TabaiInt:
+        return TabaiInt(_shared_gpu_big_int.floordiv(self._gpu, other._gpu))
+
+    def __mod__(self, other: TabaiInt) -> TabaiInt:
+        return TabaiInt(_shared_gpu_big_int.mod(self._gpu, other._gpu))
+
+    def __divmod__(self, other: TabaiInt) -> tuple[TabaiInt, TabaiInt]:
+        q, r = _shared_gpu_big_int.divmod(self._gpu, other._gpu)
+        return TabaiInt(q), TabaiInt(r)
+
     def __repr__(self) -> str:
         return f"TabaiInt({self.to_cpu()})"
