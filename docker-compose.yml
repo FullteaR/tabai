@@ -1,0 +1,17 @@
+services:
+  tabai:
+    build: 
+      context: .
+    image: fulltea/tabai
+    container_name: tabai
+    tty: true
+    volumes:
+      - ./tabai:/mnt
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - count: all
+              capabilities: [gpu]
+
+
