@@ -1,90 +1,213 @@
 import cupy as cp
-from .utils import int_to_gpu, gpu_to_int
 
-# Hillis-Steele アルゴリズムによる並列スキャンカーネル
-# 状態: 0=Kill, 1=Propagate, 2=Generate
-# ロジック: 右の要素がPropagate(1)なら左の要素の状態を引き継ぐ
-_parallel_scan_kernel = cp.RawKernel(r'''
+_BLOCK = 256
+
+_compute_states_kernel = cp.RawKernel(r'''
 extern "C" __global__
-void parallel_carry_scan(int* states, int n, int step) {
+void compute_states(
+    const unsigned int* a, int len_a,
+    const unsigned int* b, int len_b,
+    unsigned int* result, int* states,
+    int n, int is_sub)
+{
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
-    
-    int prev_idx = idx - step;
-    if (prev_idx >= 0) {
-        int current = states[idx];
-        int prev = states[prev_idx];
-        
-        // 自分の状態がPropagate(1)なら、step分前の状態を上書きする
-        if (current == 1) {
-            states[idx] = prev;
+
+    unsigned long long av = (idx < len_a) ? (unsigned long long)a[idx] : 0ULL;
+    unsigned long long bv = (idx < len_b) ? (unsigned long long)b[idx] : 0ULL;
+
+    if (is_sub == 0) {
+        unsigned long long s = av + bv;
+        result[idx] = (unsigned int)s;
+        states[idx] = (s > 0xFFFFFFFFULL) ? 2 : ((s == 0xFFFFFFFFULL) ? 1 : 0);
+    } else {
+        long long d = (long long)av - (long long)bv;
+        result[idx] = (unsigned int)d;
+        states[idx] = (d < 0) ? 2 : ((d == 0) ? 1 : 0);
+    }
+}
+''', 'compute_states')
+
+_block_scan_kernel = cp.RawKernel(r'''
+extern "C" __global__
+void block_scan(int* states, int* block_out, int n)
+{
+    extern __shared__ int sm[];
+    int* buf0 = sm;
+    int* buf1 = sm + blockDim.x;
+
+    int tid = threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + tid;
+
+    buf0[tid] = (idx < n) ? states[idx] : 0;
+    __syncthreads();
+
+    int* src = buf0;
+    int* dst = buf1;
+
+    for (int step = 1; step < (int)blockDim.x; step <<= 1) {
+        if (tid >= step && src[tid] == 1) {
+            dst[tid] = src[tid - step];
+        } else {
+            dst[tid] = src[tid];
+        }
+        __syncthreads();
+        int* tmp = src; src = dst; dst = tmp;
+    }
+
+    if (idx < n) states[idx] = src[tid];
+
+    if (block_out && tid == (int)blockDim.x - 1) {
+        int last_local = min((int)blockDim.x - 1, n - 1 - blockIdx.x * (int)blockDim.x);
+        block_out[blockIdx.x] = src[last_local];
+    }
+}
+''', 'block_scan')
+
+_propagate_kernel = cp.RawKernel(r'''
+extern "C" __global__
+void propagate(int* states, const int* block_sums, int n, int bs)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    int blk = idx / bs;
+    if (blk == 0) return;
+    if (states[idx] == 1) {
+        states[idx] = block_sums[blk - 1];
+    }
+}
+''', 'propagate')
+
+_apply_carries_kernel = cp.RawKernel(r'''
+extern "C" __global__
+void apply_carries(unsigned int* result, const int* states, int n, int is_sub)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx == 0 || idx > n) return;
+    if (idx < n) {
+        if (states[idx - 1] == 2) {
+            if (is_sub == 0) result[idx] += 1u;
+            else result[idx] -= 1u;
+        }
+    } else {
+        if (states[n - 1] == 2 && is_sub == 0) {
+            result[n] = 1u;
         }
     }
 }
-''', 'parallel_carry_scan')
+''', 'apply_carries')
+
+_find_last_nonzero_kernel = cp.RawKernel(r'''
+extern "C" __global__
+void find_last_nonzero(const unsigned int* arr, int n, int* out)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n && arr[idx] != 0) {
+        atomicMax(out, idx);
+    }
+}
+''', 'find_last_nonzero')
+
+_compare_kernel = cp.RawKernel(r'''
+extern "C" __global__
+void compare_arrays(
+    const unsigned int* a, int len_a,
+    const unsigned int* b, int len_b,
+    unsigned long long* result, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    unsigned int av = (idx < len_a) ? a[idx] : 0u;
+    unsigned int bv = (idx < len_b) ? b[idx] : 0u;
+    if (av != bv) {
+        unsigned long long enc = ((unsigned long long)(unsigned int)(idx + 1) << 1)
+                                 | ((av > bv) ? 1ULL : 0ULL);
+        atomicMax(result, enc);
+    }
+}
+''', 'compare_arrays')
+
+_shift_right_one_kernel = cp.RawKernel(r'''
+extern "C" __global__
+void shift_right_one(const unsigned int* src, unsigned int* dst, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    unsigned int val = src[idx] >> 1;
+    if (idx + 1 < n) {
+        val |= (src[idx + 1] & 1u) << 31;
+    }
+    dst[idx] = val;
+}
+''', 'shift_right_one')
+
+_shift_left_kernel = cp.RawKernel(r'''
+extern "C" __global__
+void shift_left(const unsigned int* src, int src_len,
+                unsigned int* dst, int dst_len,
+                int limb_shift, int bit_shift)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= src_len) return;
+    unsigned long long val = (unsigned long long)src[idx] << bit_shift;
+    int lo = idx + limb_shift;
+    int hi = lo + 1;
+    if (lo < dst_len)
+        atomicAdd((unsigned int*)&dst[lo], (unsigned int)(val & 0xFFFFFFFF));
+    if (bit_shift > 0 && hi < dst_len)
+        atomicAdd((unsigned int*)&dst[hi], (unsigned int)(val >> 32));
+}
+''', 'shift_left')
+
+
 
 class GPUBigInt:
     def __init__(self, max_bits=1000000):
         self.max_bits = max_bits
 
-    def _resolve_carries_gpu(self, states):
-        """CUDAカーネルを繰り返し呼び出して O(log N) でキャリーを確定させる"""
-        n = states.size
-        threads_per_block = 256
-        blocks = (n + threads_per_block - 1) // threads_per_block
-        
-        # ステップ幅を 1, 2, 4, 8... と倍にしながらスキャン
-        step = 1
-        while step < n:
-            _parallel_scan_kernel((blocks,), (threads_per_block,), (states, n, step))
-            cp.cuda.runtime.deviceSynchronize() # 各ステップの完了を待機
-            step *= 2
-        return states
+    def _scan(self, states, n):
+        blocks = (n + _BLOCK - 1) // _BLOCK
+        smem = 2 * _BLOCK * 4
 
-    def _align_and_get_states(self, a_gpu, b_gpu, mode='add'):
+        if blocks == 1:
+            dummy = cp.empty(1, dtype=cp.int32)
+            _block_scan_kernel((1,), (_BLOCK,), (states, dummy, n), shared_mem=smem)
+            return
+
+        block_sums = cp.empty(blocks, dtype=cp.int32)
+        _block_scan_kernel((blocks,), (_BLOCK,), (states, block_sums, n), shared_mem=smem)
+
+        self._scan(block_sums, blocks)
+
+        _propagate_kernel((blocks,), (_BLOCK,), (states, block_sums, n, _BLOCK))
+
+    def _addsub(self, a_gpu, b_gpu, is_sub):
         n = max(len(a_gpu), len(b_gpu))
-        a = cp.zeros(n, dtype=cp.uint32)
-        b = cp.zeros(n, dtype=cp.uint32)
-        a[:len(a_gpu)] = a_gpu
-        b[:len(b_gpu)] = b_gpu
+        extra = 0 if is_sub else 1
+        result = cp.zeros(n + extra, dtype=cp.uint32)
+        states = cp.empty(n, dtype=cp.int32)
 
-        if mode == 'add':
-            sum64 = a.astype(cp.uint64) + b.astype(cp.uint64)
-            states = cp.where(sum64 > 0xFFFFFFFF, 2, 
-                             cp.where(sum64 == 0xFFFFFFFF, 1, 0)).astype(cp.int32)
-            return states, sum64.astype(cp.uint32)
-        else:
-            diff64 = a.astype(cp.int64) - b.astype(cp.int64)
-            states = cp.where(diff64 < 0, 2, 
-                             cp.where(diff64 == 0, 1, 0)).astype(cp.int32)
-            return states, diff64.astype(cp.uint32)
+        blocks = (n + _BLOCK - 1) // _BLOCK
+        _compute_states_kernel(
+            (blocks,), (_BLOCK,),
+            (a_gpu, len(a_gpu), b_gpu, len(b_gpu), result, states, n, int(is_sub)))
+
+        self._scan(states, n)
+
+        blocks_ext = ((n + extra) + _BLOCK - 1) // _BLOCK
+        _apply_carries_kernel(
+            (blocks_ext,), (_BLOCK,),
+            (result, states, n, int(is_sub)))
+
+        return self._trim(result)
 
     def add(self, a_gpu, b_gpu):
-        states, base_res = self._align_and_get_states(a_gpu, b_gpu, 'add')
-        resolved = self._resolve_carries_gpu(states)
-        
-        actual_carries = cp.zeros(len(states), dtype=cp.uint32)
-        if len(states) > 1:
-            actual_carries[1:] = (resolved[:-1] == 2).astype(cp.uint32)
-        
-        res = base_res + actual_carries
-        if resolved[-1] == 2:
-            res = cp.concatenate([res, cp.array([1], dtype=cp.uint32)])
-        return self._trim(res)
+        return self._addsub(a_gpu, b_gpu, False)
 
     def sub(self, a_gpu, b_gpu):
-        states, base_res = self._align_and_get_states(a_gpu, b_gpu, 'sub')
-        resolved = self._resolve_carries_gpu(states)
-        
-        actual_borrows = cp.zeros(len(states), dtype=cp.uint32)
-        if len(states) > 1:
-            actual_borrows[1:] = (resolved[:-1] == 2).astype(cp.uint32)
-        
-        res = base_res - actual_borrows
-        return self._trim(res)
+        return self._addsub(a_gpu, b_gpu, True)
 
     def mul(self, a_gpu, b_gpu):
-        """GPU FFT乗算"""
         a16 = self._split_to_uint16(a_gpu)
         b16 = self._split_to_uint16(b_gpu)
 
@@ -100,8 +223,10 @@ class GPUBigInt:
         a_f[:n_a] = a16.astype(cp.float64)
         b_f[:n_b] = b16.astype(cp.float64)
 
-        fc = cp.fft.rfft(a_f) * cp.fft.rfft(b_f)
-        c = cp.fft.irfft(fc, n=n_fft)
+        fa = cp.fft.rfft(a_f)
+        fb = cp.fft.rfft(b_f)
+        fa *= fb
+        c = cp.fft.irfft(fa, n=n_fft)
 
         result = cp.zeros(n_fft + 1, dtype=cp.int64)
         result[:n_fft] = cp.rint(c).astype(cp.int64)
@@ -116,7 +241,6 @@ class GPUBigInt:
         return self._trim(self._combine_from_uint16(result.astype(cp.uint16)))
 
     def _split_to_uint16(self, arr):
-        """uint32 limb配列をuint16 half-limb配列に分割 (little-endian)"""
         low = (arr & cp.uint32(0xFFFF)).astype(cp.uint16)
         high = (arr >> cp.uint32(16)).astype(cp.uint16)
         result = cp.empty(len(arr) * 2, dtype=cp.uint16)
@@ -125,7 +249,6 @@ class GPUBigInt:
         return result
 
     def _combine_from_uint16(self, arr):
-        """uint16 half-limb配列をuint32 limb配列に結合"""
         if len(arr) % 2 == 1:
             arr = cp.concatenate([arr, cp.array([0], dtype=cp.uint16)])
         low = arr[0::2].astype(cp.uint32)
@@ -133,23 +256,28 @@ class GPUBigInt:
         return low | (high << cp.uint32(16))
 
     def _trim(self, gpu_arr):
-        nonzero = cp.where(gpu_arr != 0)[0]
-        if nonzero.size == 0:
+        n = len(gpu_arr)
+        if n == 0:
             return cp.array([0], dtype=cp.uint32)
-        return gpu_arr[:int(nonzero[-1]) + 1]
+        idx_buf = cp.full(1, -1, dtype=cp.int32)
+        blocks = (n + _BLOCK - 1) // _BLOCK
+        _find_last_nonzero_kernel((blocks,), (_BLOCK,), (gpu_arr, n, idx_buf))
+        last = int(idx_buf[0])
+        if last < 0:
+            return cp.array([0], dtype=cp.uint32)
+        return gpu_arr[:last + 1]
 
     def _compare(self, a_gpu, b_gpu):
         n = max(len(a_gpu), len(b_gpu))
-        a = cp.zeros(n, dtype=cp.uint32)
-        b = cp.zeros(n, dtype=cp.uint32)
-        a[:len(a_gpu)] = a_gpu
-        b[:len(b_gpu)] = b_gpu
-        diff = a.astype(cp.int64) - b.astype(cp.int64)
-        nonzero_idx = cp.nonzero(diff)[0]
-        if len(nonzero_idx) == 0:
+        result_buf = cp.zeros(1, dtype=cp.uint64)
+        blocks = (n + _BLOCK - 1) // _BLOCK
+        _compare_kernel(
+            (blocks,), (_BLOCK,),
+            (a_gpu, len(a_gpu), b_gpu, len(b_gpu), result_buf, n))
+        val = int(result_buf[0])
+        if val == 0:
             return 0
-        top_idx = int(nonzero_idx[-1])
-        return 1 if int(diff[top_idx]) > 0 else -1
+        return 1 if (val & 1) else -1
 
     def _bit_length(self, a_gpu):
         a = self._trim(a_gpu)
@@ -164,19 +292,17 @@ class GPUBigInt:
         bit_shift = bits % 32
         n = len(a_gpu) + limb_shift + (1 if bit_shift > 0 else 0)
         result = cp.zeros(n, dtype=cp.uint32)
-        if bit_shift == 0:
-            result[limb_shift:limb_shift + len(a_gpu)] = a_gpu
-        else:
-            ext = a_gpu.astype(cp.uint64) << cp.uint64(bit_shift)
-            result[limb_shift:limb_shift + len(a_gpu)] = (ext & 0xFFFFFFFF).astype(cp.uint32)
-            result[limb_shift + 1:limb_shift + 1 + len(a_gpu)] += (ext >> 32).astype(cp.uint32)
+        blocks = (len(a_gpu) + _BLOCK - 1) // _BLOCK
+        _shift_left_kernel(
+            (blocks,), (_BLOCK,),
+            (a_gpu, len(a_gpu), result, n, limb_shift, bit_shift))
         return self._trim(result)
 
     def _shift_right_one(self, a_gpu):
-        result = a_gpu >> cp.uint32(1)
-        if len(a_gpu) > 1:
-            carry_bits = (a_gpu[1:] & cp.uint32(1)) << cp.uint32(31)
-            result[:-1] |= carry_bits
+        n = len(a_gpu)
+        result = cp.empty(n, dtype=cp.uint32)
+        blocks = (n + _BLOCK - 1) // _BLOCK
+        _shift_right_one_kernel((blocks,), (_BLOCK,), (a_gpu, result, n))
         return self._trim(result)
 
     def divmod(self, a_gpu, b_gpu):
