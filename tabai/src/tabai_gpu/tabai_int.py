@@ -133,6 +133,28 @@ class TabaiInt:
             return NotImplemented
         return other.__divmod__(self)
 
+    def __pow__(self, other: TabaiInt | int) -> TabaiInt:
+        other = self._coerce(other)
+        if other is NotImplemented:
+            return NotImplemented
+        if other._sign == -1:
+            raise ValueError("negative exponent is not supported")
+        result = TabaiInt(1)
+        base = TabaiInt(self._gpu.copy(), self._sign)
+        exp = other.to_cpu()
+        while exp > 0:
+            if exp & 1:
+                result = result * base
+            base = base * base
+            exp >>= 1
+        return result
+
+    def __rpow__(self, other: int) -> TabaiInt:
+        other = self._coerce(other)
+        if other is NotImplemented:
+            return NotImplemented
+        return other.__pow__(self)
+
     def _cmp(self, other: TabaiInt) -> int:
         if self._sign != other._sign:
             return 1 if self._sign > other._sign else -1
