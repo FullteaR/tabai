@@ -244,3 +244,102 @@ class TestComparison:
             assert (ta == tb) == (a == b)
             assert (ta < tb) == (a < b)
             assert (ta > tb) == (a > b)
+
+
+class TestIntInterop:
+    def test_add_tabai_int(self):
+        assert (TabaiInt(10) + 3).to_cpu() == 13
+        assert (TabaiInt(-10) + 3).to_cpu() == -7
+        assert (TabaiInt(10) + (-3)).to_cpu() == 7
+
+    def test_radd_int_tabai(self):
+        assert (3 + TabaiInt(10)).to_cpu() == 13
+        assert (3 + TabaiInt(-10)).to_cpu() == -7
+        assert ((-3) + TabaiInt(10)).to_cpu() == 7
+
+    def test_sub_tabai_int(self):
+        assert (TabaiInt(10) - 3).to_cpu() == 7
+        assert (TabaiInt(-10) - 3).to_cpu() == -13
+        assert (TabaiInt(10) - (-3)).to_cpu() == 13
+
+    def test_rsub_int_tabai(self):
+        assert (3 - TabaiInt(10)).to_cpu() == -7
+        assert (3 - TabaiInt(-10)).to_cpu() == 13
+        assert ((-3) - TabaiInt(10)).to_cpu() == -13
+
+    def test_mul_tabai_int(self):
+        assert (TabaiInt(10) * 3).to_cpu() == 30
+        assert (TabaiInt(-10) * 3).to_cpu() == -30
+        assert (TabaiInt(10) * (-3)).to_cpu() == -30
+        assert (TabaiInt(10) * 0).to_cpu() == 0
+
+    def test_rmul_int_tabai(self):
+        assert (3 * TabaiInt(10)).to_cpu() == 30
+        assert (3 * TabaiInt(-10)).to_cpu() == -30
+        assert ((-3) * TabaiInt(10)).to_cpu() == -30
+        assert (0 * TabaiInt(10)).to_cpu() == 0
+
+    def test_floordiv_tabai_int(self):
+        assert (TabaiInt(10) // 3).to_cpu() == 3
+        assert (TabaiInt(-7) // 2).to_cpu() == -7 // 2
+        assert (TabaiInt(7) // (-2)).to_cpu() == 7 // -2
+
+    def test_rfloordiv_int_tabai(self):
+        assert (10 // TabaiInt(3)).to_cpu() == 3
+        assert ((-7) // TabaiInt(2)).to_cpu() == -7 // 2
+        assert (7 // TabaiInt(-2)).to_cpu() == 7 // -2
+
+    def test_mod_tabai_int(self):
+        assert (TabaiInt(10) % 3).to_cpu() == 1
+        assert (TabaiInt(-7) % 2).to_cpu() == -7 % 2
+        assert (TabaiInt(7) % (-2)).to_cpu() == 7 % -2
+
+    def test_rmod_int_tabai(self):
+        assert (10 % TabaiInt(3)).to_cpu() == 1
+        assert ((-7) % TabaiInt(2)).to_cpu() == -7 % 2
+        assert (7 % TabaiInt(-2)).to_cpu() == 7 % -2
+
+    def test_divmod_tabai_int(self):
+        q, r = divmod(TabaiInt(10), 3)
+        assert q.to_cpu() == 3
+        assert r.to_cpu() == 1
+
+    def test_rdivmod_int_tabai(self):
+        q, r = divmod(10, TabaiInt(3))
+        assert q.to_cpu() == 3
+        assert r.to_cpu() == 1
+
+    def test_compare_tabai_int(self):
+        assert TabaiInt(5) == 5
+        assert TabaiInt(5) != 3
+        assert TabaiInt(5) > 3
+        assert TabaiInt(5) >= 5
+        assert TabaiInt(3) < 5
+        assert TabaiInt(3) <= 3
+
+    def test_int_interop_exhaustive(self):
+        for a in range(-20, 21):
+            for b in range(-20, 21):
+                ta = TabaiInt(a)
+                assert (ta + b).to_cpu() == a + b
+                assert (b + ta).to_cpu() == b + a
+                assert (ta - b).to_cpu() == a - b
+                assert (b - ta).to_cpu() == b - a
+                assert (ta * b).to_cpu() == a * b
+                assert (b * ta).to_cpu() == b * a
+                if b != 0:
+                    assert (ta // b).to_cpu() == a // b
+                    assert (ta % b).to_cpu() == a % b
+                if a != 0:
+                    assert (b // ta).to_cpu() == b // a
+                    assert (b % ta).to_cpu() == b % a
+
+    def test_int_interop_large(self):
+        a = 10**100
+        b = 20**100
+        assert (TabaiInt(a) + b).to_cpu() == a + b
+        assert (b + TabaiInt(a)).to_cpu() == b + a
+        assert (TabaiInt(a) - b).to_cpu() == a - b
+        assert (b - TabaiInt(a)).to_cpu() == b - a
+        assert (TabaiInt(a) * b).to_cpu() == a * b
+        assert (b * TabaiInt(a)).to_cpu() == b * a
