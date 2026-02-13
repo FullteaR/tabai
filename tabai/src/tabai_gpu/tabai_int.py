@@ -23,6 +23,14 @@ class TabaiInt:
         if _is_zero(self._gpu):
             self._sign = 1
 
+    @staticmethod
+    def _coerce(other: TabaiInt | int) -> TabaiInt:
+        if isinstance(other, TabaiInt):
+            return other
+        if isinstance(other, int):
+            return TabaiInt(other)
+        return NotImplemented
+
     def to_cpu(self) -> int:
         val = gpu_to_int(self._gpu)
         return val if self._sign == 1 else -val
@@ -35,7 +43,10 @@ class TabaiInt:
     def __abs__(self) -> TabaiInt:
         return TabaiInt(self._gpu.copy(), 1)
 
-    def __add__(self, other: TabaiInt) -> TabaiInt:
+    def __add__(self, other: TabaiInt | int) -> TabaiInt:
+        other = self._coerce(other)
+        if other is NotImplemented:
+            return NotImplemented
         if self._sign == other._sign:
             result = _shared_gpu_big_int.add(self._gpu, other._gpu)
             return TabaiInt(result, self._sign)
@@ -48,24 +59,39 @@ class TabaiInt:
         result = _shared_gpu_big_int.sub(other._gpu, self._gpu)
         return TabaiInt(result, other._sign)
 
-    def __sub__(self, other: TabaiInt) -> TabaiInt:
+    def __sub__(self, other: TabaiInt | int) -> TabaiInt:
+        other = self._coerce(other)
+        if other is NotImplemented:
+            return NotImplemented
         return self + (-other)
 
-    def __mul__(self, other: TabaiInt) -> TabaiInt:
+    def __mul__(self, other: TabaiInt | int) -> TabaiInt:
+        other = self._coerce(other)
+        if other is NotImplemented:
+            return NotImplemented
         result = _shared_gpu_big_int.mul(self._gpu, other._gpu)
         if _is_zero(result):
             return TabaiInt(result, 1)
         return TabaiInt(result, self._sign * other._sign)
 
-    def __floordiv__(self, other: TabaiInt) -> TabaiInt:
+    def __floordiv__(self, other: TabaiInt | int) -> TabaiInt:
+        other = self._coerce(other)
+        if other is NotImplemented:
+            return NotImplemented
         q, _ = divmod(self, other)
         return q
 
-    def __mod__(self, other: TabaiInt) -> TabaiInt:
+    def __mod__(self, other: TabaiInt | int) -> TabaiInt:
+        other = self._coerce(other)
+        if other is NotImplemented:
+            return NotImplemented
         _, r = divmod(self, other)
         return r
 
-    def __divmod__(self, other: TabaiInt) -> tuple[TabaiInt, TabaiInt]:
+    def __divmod__(self, other: TabaiInt | int) -> tuple[TabaiInt, TabaiInt]:
+        other = self._coerce(other)
+        if other is NotImplemented:
+            return NotImplemented
         q_gpu, r_gpu = _shared_gpu_big_int.divmod(self._gpu, other._gpu)
         if _is_zero(r_gpu):
             sign = 1 if _is_zero(q_gpu) else self._sign * other._sign
@@ -77,6 +103,36 @@ class TabaiInt:
         r_adj = _shared_gpu_big_int.sub(other._gpu, r_gpu)
         return TabaiInt(q_adj, -1), TabaiInt(r_adj, other._sign)
 
+    def __radd__(self, other: int) -> TabaiInt:
+        return self.__add__(other)
+
+    def __rsub__(self, other: int) -> TabaiInt:
+        other = self._coerce(other)
+        if other is NotImplemented:
+            return NotImplemented
+        return other.__sub__(self)
+
+    def __rmul__(self, other: int) -> TabaiInt:
+        return self.__mul__(other)
+
+    def __rfloordiv__(self, other: int) -> TabaiInt:
+        other = self._coerce(other)
+        if other is NotImplemented:
+            return NotImplemented
+        return other.__floordiv__(self)
+
+    def __rmod__(self, other: int) -> TabaiInt:
+        other = self._coerce(other)
+        if other is NotImplemented:
+            return NotImplemented
+        return other.__mod__(self)
+
+    def __rdivmod__(self, other: int) -> tuple[TabaiInt, TabaiInt]:
+        other = self._coerce(other)
+        if other is NotImplemented:
+            return NotImplemented
+        return other.__divmod__(self)
+
     def _cmp(self, other: TabaiInt) -> int:
         if self._sign != other._sign:
             return 1 if self._sign > other._sign else -1
@@ -86,25 +142,39 @@ class TabaiInt:
         return cmp
 
     def __eq__(self, other: object) -> bool:
-        if not isinstance(other, TabaiInt):
+        coerced = self._coerce(other)
+        if coerced is NotImplemented:
             return NotImplemented
-        return self._cmp(other) == 0
+        return self._cmp(coerced) == 0
 
     def __ne__(self, other: object) -> bool:
-        if not isinstance(other, TabaiInt):
+        coerced = self._coerce(other)
+        if coerced is NotImplemented:
             return NotImplemented
-        return self._cmp(other) != 0
+        return self._cmp(coerced) != 0
 
-    def __lt__(self, other: TabaiInt) -> bool:
+    def __lt__(self, other: TabaiInt | int) -> bool:
+        other = self._coerce(other)
+        if other is NotImplemented:
+            return NotImplemented
         return self._cmp(other) < 0
 
-    def __le__(self, other: TabaiInt) -> bool:
+    def __le__(self, other: TabaiInt | int) -> bool:
+        other = self._coerce(other)
+        if other is NotImplemented:
+            return NotImplemented
         return self._cmp(other) <= 0
 
-    def __gt__(self, other: TabaiInt) -> bool:
+    def __gt__(self, other: TabaiInt | int) -> bool:
+        other = self._coerce(other)
+        if other is NotImplemented:
+            return NotImplemented
         return self._cmp(other) > 0
 
-    def __ge__(self, other: TabaiInt) -> bool:
+    def __ge__(self, other: TabaiInt | int) -> bool:
+        other = self._coerce(other)
+        if other is NotImplemented:
+            return NotImplemented
         return self._cmp(other) >= 0
 
     def __repr__(self) -> str:
