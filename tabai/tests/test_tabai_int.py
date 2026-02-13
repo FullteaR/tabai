@@ -129,3 +129,42 @@ def test_large_ops(a, b):
     assert (TabaiInt(a) * TabaiInt(b)).to_cpu() == a * b
     assert (TabaiInt(a) // TabaiInt(b)).to_cpu() == a // b
     assert (TabaiInt(a) % TabaiInt(b)).to_cpu() == a % b
+
+
+def test_pow_basic():
+    assert (TabaiInt(2) ** TabaiInt(5)).to_cpu() == 32
+    assert (TabaiInt(2) ** 4).to_cpu() == 16
+    assert (3 ** TabaiInt(5)).to_cpu() == 243
+
+
+def test_pow_zero_exponent():
+    assert (TabaiInt(5) ** 0).to_cpu() == 1
+    assert (TabaiInt(0) ** 0).to_cpu() == 1
+
+
+def test_pow_one_exponent():
+    assert (TabaiInt(42) ** 1).to_cpu() == 42
+
+
+def test_pow_zero_base():
+    assert (TabaiInt(0) ** 5).to_cpu() == 0
+
+
+def test_pow_one_base():
+    assert (TabaiInt(1) ** 100).to_cpu() == 1
+
+
+def test_pow_negative_exponent():
+    with pytest.raises(ValueError):
+        TabaiInt(2) ** TabaiInt(-3)
+
+
+def test_pow_small_numbers():
+    for a in range(0, 20):
+        for b in range(0, 10):
+            assert (TabaiInt(a) ** TabaiInt(b)).to_cpu() == a ** b
+
+
+def test_pow_large():
+    a, b = 10**100, 3
+    assert (TabaiInt(a) ** TabaiInt(b)).to_cpu() == a ** b
