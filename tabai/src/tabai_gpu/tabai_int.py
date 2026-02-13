@@ -139,15 +139,27 @@ class TabaiInt:
             return NotImplemented
         if other._sign == -1:
             raise ValueError("negative exponent is not supported")
-        result = TabaiInt(1)
-        base = TabaiInt(self._gpu.copy(), self._sign)
-        exp = other.to_cpu()
-        while exp > 0:
-            if exp & 1:
-                result = result * base
-            base = base * base
-            exp >>= 1
-        return result
+        exp_limbs = cp.asnumpy(other._gpu)
+        total_bits = (len(exp_limbs) - 1) * 32 + int(exp_limbs[-1]).bit_length()
+        if total_bits == 0:
+            return TabaiInt(1)
+        calc = _shared_gpu_big_int
+        result_gpu = cp.array([1], dtype=cp.uint32)
+        base_gpu = self._gpu
+        bit_idx = 0
+        for limb in exp_limbs:
+            limb_val = int(limb)
+            for _ in range(32):
+                if bit_idx >= total_bits:
+                    break
+                if limb_val & 1:
+                    result_gpu = calc.mul(result_gpu, base_gpu)
+                limb_val >>= 1
+                bit_idx += 1
+                if bit_idx < total_bits:
+                    base_gpu = calc.mul(base_gpu, base_gpu)
+        result_sign = self._sign if exp_limbs[0] & 1 else 1
+        return TabaiInt(result_gpu, result_sign)
 
     def __rpow__(self, other: int) -> TabaiInt:
         other = self._coerce(other)
