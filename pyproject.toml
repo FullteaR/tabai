@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tabai"
+version = "0.1.0"
+description = "GPU-accelerated arbitrary-precision integer arithmetic using CuPy"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = [
+    "cupy",
+    "numpy",
+]
+
+[project.urls]
+Repository = "https://github.com/FullteaR/tabai"
+
+[tool.setuptools.packages.find]
+where = ["tabai/src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tabai/tests"]
