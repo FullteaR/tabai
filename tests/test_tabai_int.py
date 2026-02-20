@@ -1,5 +1,5 @@
 import pytest
-from tabai_gpu import TabaiInt
+from tabai import TabaiInt
 
 
 def test_add_1_1():

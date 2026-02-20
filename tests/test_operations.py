@@ -1,9 +1,9 @@
 import pytest
 import random
 import cupy as cp
-from tabai_gpu.core import GPUBigInt
-from tabai_gpu.utils import int_to_gpu, gpu_to_int
-from tabai_gpu.tabai_int import TabaiInt
+from tabai.core import GPUBigInt
+from tabai.utils import int_to_gpu, gpu_to_int
+from tabai.tabai_int import TabaiInt
 
 @pytest.fixture
 def calc():
