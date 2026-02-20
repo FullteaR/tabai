@@ -5,6 +5,6 @@ RUN apt update -y && apt upgrade -y && apt autoremove -y
 RUN pip install pytest
 
 WORKDIR /mnt
-ENV PYTHONPATH $PYTHONPATH:/mnt/src
+RUN pip install -e .
 CMD /bin/bash
 

@@ -9,16 +9,13 @@ description = "GPU-accelerated arbitrary-precision integer arithmetic using CuPy
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
-dependencies = [
-    "cupy",
-    "numpy",
-]
+dependencies = []
 
 [project.urls]
 Repository = "https://github.com/FullteaR/tabai"
 
 [tool.setuptools.packages.find]
-where = ["tabai/src"]
+where = ["src"]
 
 [tool.pytest.ini_options]
-testpaths = ["tabai/tests"]
+testpaths = ["tests"]
