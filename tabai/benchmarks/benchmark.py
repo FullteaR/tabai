@@ -22,10 +22,12 @@ from typing import Callable
 # ---------------------------------------------------------------------------
 try:
     from tabai_gpu import TabaiInt
+    import cupy as cp
 
     HAS_TABAI = True
 except ImportError:
     HAS_TABAI = False
+    cp = None
 
 try:
     import gmpy2
@@ -45,14 +47,23 @@ def _random_int(bits: int) -> int:
     return random.getrandbits(bits) | (1 << (bits - 1))
 
 
+def _gpu_sync() -> None:
+    """Synchronize the default CUDA stream so GPU work is truly finished."""
+    if cp is not None:
+        cp.cuda.Stream.null.synchronize()
+
+
 def _bench(fn: Callable[[], object], warmup: int = 2, repeat: int = 5) -> float:
     """Run *fn* with warm-up, return the **median** elapsed time in seconds."""
     for _ in range(warmup):
         fn()
+        _gpu_sync()
     times: list[float] = []
     for _ in range(repeat):
+        _gpu_sync()
         t0 = time.perf_counter()
         fn()
+        _gpu_sync()
         t1 = time.perf_counter()
         times.append(t1 - t0)
     return statistics.median(times)
@@ -162,6 +173,10 @@ class _TabaiBackend:
 # ---------------------------------------------------------------------------
 BIT_SIZES = [1_000, 10_000, 100_000, 1_000_000]
 
+# Division is O(n) Python-level iterations in the current TabaiInt implementation,
+# so 1M bits would be extremely slow.  Use a smaller ceiling for div/mod.
+DIV_BIT_SIZES = [1_000, 10_000, 100_000]
+
 # For pow the exponent must be small; otherwise all backends are impractical.
 POW_EXPONENTS = [2, 3, 10]
 POW_BASE_BITS = [1_000, 10_000, 100_000]
@@ -269,7 +284,7 @@ def main() -> None:
 
     # --- floor division -----------------------------------------------------
     _print_header(backends)
-    for bits in BIT_SIZES:
+    for bits in DIV_BIT_SIZES:
         _run_op_bench(
             "floordiv",
             bits,
@@ -284,7 +299,7 @@ def main() -> None:
 
     # --- modulo -------------------------------------------------------------
     _print_header(backends)
-    for bits in BIT_SIZES:
+    for bits in DIV_BIT_SIZES:
         _run_op_bench(
             "mod",
             bits,
