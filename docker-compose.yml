@@ -6,7 +6,7 @@ services:
     container_name: tabai
     tty: true
     volumes:
-      - ./tabai:/mnt
+      - .:/mnt
     deploy:
       resources:
         reservations:
