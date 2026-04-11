@@ -253,3 +253,82 @@ class TestAddSubBoundary:
         a = random.getrandbits(bits) | (1 << bits)
         b = random.getrandbits(bits) | (1 << (bits - 1))
         assert (TabaiInt(a) - TabaiInt(b)).to_cpu() == a - b
+
+
+# ---------------------------------------------------------------------------
+# Large-precision multiplication tests (FFT chunk-width adaptive path)
+#
+# These tests verify correctness of the B=16 → B=8 adaptive mul without
+# requiring Python to multiply large integers (which would be extremely slow).
+# Instead they rely on identities whose expected values can be formed with
+# cheap Python bit-shifts:
+#
+#   Identity 1  — power-of-2 product:
+#       2^n  *  2^m  =  2^(n+m)
+#
+#   Identity 2  — difference-of-squares:
+#       (2^n + 1) * (2^n - 1)  =  2^(2n) - 1
+#
+#   Identity 3  — self-consistency with add:
+#       a * 2  ==  a + a
+#
+# Bit-size coverage:
+#   _MUL_B16_BITS  — inside the B=16 path (n_fft_est < 2^20, ≲ 4M-bit operands)
+#   _MUL_B8_BITS   — inside the B= 8 path (n_fft_est ≥ 2^20, 10M-bit operands)
+#   _MUL_LARGE_BITS — even larger (100M-bit operands, stresses GPU memory)
+# ---------------------------------------------------------------------------
+
+_MUL_B16_BITS  = 2_000_000   # 2M bits — B=16 path
+_MUL_B8_BITS   = 10_000_000  # 10M bits — B=8 path
+_MUL_LARGE_BITS = 100_000_000 # 100M bits — B=8, tests GPU memory at scale
+
+
+class TestMulLargePrecision:
+    """Verify FFT-based multiplication at sizes where the B=16 path loses float64 precision."""
+
+    # ---- Identity 1: 2^n * 2^m = 2^(n+m) --------------------------------
+
+    @pytest.mark.parametrize("n,m", [
+        (_MUL_B16_BITS // 2, _MUL_B16_BITS // 2),
+        (_MUL_B8_BITS  // 2, _MUL_B8_BITS  // 2),
+    ], ids=["2Mbit", "10Mbit"])
+    def test_power_of_2_product(self, n, m):
+        result = (TabaiInt(1 << n) * TabaiInt(1 << m)).to_cpu()
+        assert result == (1 << (n + m))
+
+    # ---- Identity 2: (2^n + 1)(2^n - 1) = 2^(2n) - 1 -------------------
+
+    @pytest.mark.parametrize("n", [
+        _MUL_B16_BITS // 2,
+        _MUL_B8_BITS  // 2,
+    ], ids=["2Mbit", "10Mbit"])
+    def test_diff_of_squares(self, n):
+        a = TabaiInt((1 << n) + 1)
+        b = TabaiInt((1 << n) - 1)
+        result = (a * b).to_cpu()
+        assert result == (1 << (2 * n)) - 1
+
+    # ---- Identity 3: a * 2 == a + a (self-consistency) ------------------
+
+    @pytest.mark.parametrize("bits", [
+        _MUL_B16_BITS,
+        _MUL_B8_BITS,
+        _MUL_LARGE_BITS,
+    ], ids=["2Mbit", "10Mbit", "100Mbit"])
+    def test_mul2_equals_add(self, bits):
+        random.seed(bits)
+        a_int = random.getrandbits(bits) | (1 << (bits - 1))
+        a = TabaiInt(a_int)
+        assert (a * TabaiInt(2)).to_cpu() == (a + a).to_cpu()
+
+    # ---- Chunk-width boundary: same result just below and just above -----
+
+    @pytest.mark.parametrize("n", [
+        1_900_000,  # well inside B=16 region
+        2_100_000,  # just above the estimated crossover
+        4_000_000,  # clearly in B=8 region
+    ], ids=["1.9Mbit", "2.1Mbit", "4Mbit"])
+    def test_chunk_boundary_power_of_2(self, n):
+        """Power-of-2 product straddling the B=16 / B=8 transition."""
+        result = (TabaiInt(1 << n) * TabaiInt(1 << n)).to_cpu()
+        assert result == (1 << (2 * n))

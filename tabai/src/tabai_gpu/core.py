@@ -1,4 +1,5 @@
 import cupy as cp
+import numpy as np
 
 _BLOCK = 256
 
@@ -252,25 +253,29 @@ void addsub_small(
 
 class GPUBigInt:
     def __init__(self, max_bits=1_000_000):
-        self.max_bits = max_bits
-        max_limbs = (max_bits + 31) // 32
-
-        # Working buffer for states (large path only)
-        self._states_buf = cp.empty(max_limbs, dtype=cp.int32)
-
-        # Working buffers for scan block_sums at each recursion level
         self._scan_dummy = cp.empty(1, dtype=cp.int32)
+        self._trim_idx_buf = cp.empty(1, dtype=cp.int32)
+        self._states_buf = cp.empty(0, dtype=cp.int32)  # grown lazily
         self._scan_bufs: list[cp.ndarray] = []
-        size = max_limbs
+        self._ensure_capacity((max_bits + 31) // 32)
+
+    def _ensure_capacity(self, n: int) -> None:
+        """Grow pre-allocated working buffers so they can handle n limbs.
+
+        Called at the start of any operation that uses the large-path buffers.
+        Reallocation is amortised: we grow to the new size and never shrink.
+        """
+        if n <= len(self._states_buf):
+            return
+        self._states_buf = cp.empty(n, dtype=cp.int32)
+        self._scan_bufs = []
+        size = n
         while True:
             blocks = (size + _BLOCK - 1) // _BLOCK
             if blocks <= 1:
                 break
             self._scan_bufs.append(cp.empty(blocks, dtype=cp.int32))
             size = blocks
-
-        # Trim index buffer shared by both paths
-        self._trim_idx_buf = cp.empty(1, dtype=cp.int32)
 
     def _scan(self, states, n, _level=0):
         blocks = (n + _BLOCK - 1) // _BLOCK
@@ -308,6 +313,7 @@ class GPUBigInt:
                 return cp.array([0], dtype=cp.uint32)
             return result[:last + 1]
         else:
+            self._ensure_capacity(n)
             states = self._states_buf[:n]
             blocks = (n + _BLOCK - 1) // _BLOCK
             _compute_states_kernel(
@@ -327,11 +333,40 @@ class GPUBigInt:
         return self._addsub(a_gpu, b_gpu, True)
 
     def mul(self, a_gpu, b_gpu):
-        a16 = self._split_to_uint16(a_gpu)
-        b16 = self._split_to_uint16(b_gpu)
+        # ------------------------------------------------------------------ #
+        # Adaptive chunk width to maintain float64 precision.
+        #
+        # The FFT convolution computes coefficients whose maximum magnitude is
+        # bounded by  n_fft × (2^B - 1)^2 ≈ n_fft × 2^(2B).
+        # float64 can represent integers up to 2^53 exactly, so safe rounding
+        # of the IFFT output requires:
+        #
+        #   n_fft × 2^(2B) < 2^52   (1 bit headroom for FFT rounding errors)
+        #
+        # With B = 16:  safe when n_fft < 2^20  (~4M-bit operands).
+        # With B =  8:  safe when n_fft < 2^36  (operands up to ~10 Gbits).
+        #
+        # Estimate n_fft using the worst case (B = 16) to decide which path
+        # to take; the actual n_fft for B = 8 is 2× larger but still safe.
+        # ------------------------------------------------------------------ #
+        n_chunks_16_est = (len(a_gpu) + len(b_gpu)) * 2
+        n_fft_est = 1
+        while n_fft_est < n_chunks_16_est:
+            n_fft_est <<= 1
 
-        n_a = len(a16)
-        n_b = len(b16)
+        if n_fft_est < (1 << 20):
+            chunk_bits = 16
+            # uint32 viewed as uint16 gives [lo, hi] per limb (little-endian)
+            a_chunks = cp.ascontiguousarray(a_gpu).view(cp.uint16)
+            b_chunks = cp.ascontiguousarray(b_gpu).view(cp.uint16)
+        else:
+            chunk_bits = 8
+            # uint32 viewed as uint8 gives [b0, b1, b2, b3] per limb
+            a_chunks = cp.ascontiguousarray(a_gpu).view(cp.uint8)
+            b_chunks = cp.ascontiguousarray(b_gpu).view(cp.uint8)
+
+        n_a = len(a_chunks)
+        n_b = len(b_chunks)
         n_conv = n_a + n_b - 1
         n_fft = 1
         while n_fft < n_conv:
@@ -339,8 +374,8 @@ class GPUBigInt:
 
         a_f = cp.zeros(n_fft, dtype=cp.float64)
         b_f = cp.zeros(n_fft, dtype=cp.float64)
-        a_f[:n_a] = a16.astype(cp.float64)
-        b_f[:n_b] = b16.astype(cp.float64)
+        a_f[:n_a] = a_chunks.astype(cp.float64)
+        b_f[:n_b] = b_chunks.astype(cp.float64)
 
         fa = cp.fft.rfft(a_f)
         fb = cp.fft.rfft(b_f)
@@ -350,29 +385,22 @@ class GPUBigInt:
         result = cp.zeros(n_fft + 1, dtype=cp.int64)
         result[:n_fft] = cp.rint(c).astype(cp.int64)
 
+        chunk_mask = cp.int64((1 << chunk_bits) - 1)
         while True:
-            carries = result >> cp.int64(16)
-            result = result & cp.int64(0xFFFF)
+            carries = result >> cp.int64(chunk_bits)
+            result &= chunk_mask
             if cp.all(carries == 0):
                 break
             result[1:] += carries[:-1]
 
-        return self._trim(self._combine_from_uint16(result.astype(cp.uint16)))
-
-    def _split_to_uint16(self, arr):
-        low = (arr & cp.uint32(0xFFFF)).astype(cp.uint16)
-        high = (arr >> cp.uint32(16)).astype(cp.uint16)
-        result = cp.empty(len(arr) * 2, dtype=cp.uint16)
-        result[0::2] = low
-        result[1::2] = high
-        return result
-
-    def _combine_from_uint16(self, arr):
-        if len(arr) % 2 == 1:
-            arr = cp.concatenate([arr, cp.array([0], dtype=cp.uint16)])
-        low = arr[0::2].astype(cp.uint32)
-        high = arr[1::2].astype(cp.uint32)
-        return low | (high << cp.uint32(16))
+        # Recombine: view small-int array as uint32 limbs.
+        out_dtype = cp.uint16 if chunk_bits == 16 else cp.uint8
+        chunks_per_limb = 32 // chunk_bits  # 2 for uint16, 4 for uint8
+        out = result.astype(out_dtype)
+        pad = (-len(out)) % chunks_per_limb
+        if pad:
+            out = cp.concatenate([out, cp.zeros(pad, dtype=out_dtype)])
+        return self._trim(out.view(cp.uint32))
 
     def _trim(self, gpu_arr):
         n = len(gpu_arr)
@@ -425,6 +453,23 @@ class GPUBigInt:
         _shift_right_one_kernel((blocks,), (_BLOCK,), (a_gpu, result, n))
         return self._trim(result)
 
+    def _to_int(self, gpu_arr):
+        """Convert GPU uint32 little-endian limb array to Python int."""
+        arr = cp.asnumpy(self._trim(gpu_arr))
+        return int.from_bytes(arr.tobytes(), 'little')
+
+    def _from_int(self, n):
+        """Convert non-negative Python int to GPU uint32 little-endian limb array."""
+        if n == 0:
+            return cp.array([0], dtype=cp.uint32)
+        byte_len = (n.bit_length() + 7) // 8
+        b = n.to_bytes(byte_len, 'little')
+        pad = (-len(b)) % 4
+        if pad:
+            b += b'\x00' * pad
+        arr_np = np.frombuffer(b, dtype=np.uint32)
+        return cp.asarray(arr_np)
+
     def divmod(self, a_gpu, b_gpu):
         b = self._trim(b_gpu)
         a = self._trim(a_gpu)
@@ -435,22 +480,42 @@ class GPUBigInt:
             return cp.array([0], dtype=cp.uint32), a.copy()
         if cmp == 0:
             return cp.array([1], dtype=cp.uint32), cp.array([0], dtype=cp.uint32)
+
         a_bits = self._bit_length(a)
-        b_bits = self._bit_length(b)
-        shift_max = a_bits - b_bits
-        q_limbs = (shift_max + 32) // 32
-        quotient = cp.zeros(q_limbs, dtype=cp.uint32)
-        remainder = a.copy()
-        shifted_b = self._shift_left(b, shift_max)
-        for i in range(shift_max, -1, -1):
-            if self._compare(remainder, shifted_b) >= 0:
-                remainder = self.sub(remainder, shifted_b)
-                limb_idx = i // 32
-                bit_idx = i % 32
-                quotient[limb_idx] = cp.uint32(int(quotient[limb_idx]) | (1 << bit_idx))
-            if i > 0:
-                shifted_b = self._shift_right_one(shifted_b)
-        return self._trim(quotient), self._trim(remainder)
+
+        # p = smallest multiple of 32 that is >= a_bits.
+        # With p >= a_bits, the approximation q0 satisfies q-1 <= q0 <= q,
+        # so at most one correction is needed after the main computation.
+        p_limbs = (a_bits + 31) // 32
+        p = p_limbs * 32
+
+        # Compute reciprocal x = floor(2^p / b) using Python integer arithmetic.
+        # Python's big-int // uses fast algorithms (Karatsuba etc.) internally.
+        # The round-trip (GPU→CPU→GPU) is justified: b is transferred once, x once,
+        # while all expensive multiplications (a*x, q0*b) stay on the GPU.
+        b_cpu = self._to_int(b)
+        x_cpu = (1 << p) // b_cpu
+        x = self._from_int(x_cpu)
+
+        # q0 = floor(a * x / 2^p)
+        # Since p = p_limbs * 32, the right-shift is a free array slice (little-endian).
+        ax = self.mul(a, x)
+        if len(ax) <= p_limbs:
+            # Should not happen when a >= b, but handle defensively.
+            q0 = cp.array([0], dtype=cp.uint32)
+        else:
+            q0 = self._trim(ax[p_limbs:])
+
+        # r = a - q0 * b  (always >= 0 since q0 <= floor(a/b))
+        q0b = self.mul(q0, b)
+        r = self.sub(a, q0b)
+
+        # q0 may be off by 1 (too low): if r >= b, correct once.
+        if self._compare(r, b) >= 0:
+            r = self.sub(r, b)
+            q0 = self.add(q0, cp.array([1], dtype=cp.uint32))
+
+        return self._trim(q0), self._trim(r)
 
     def floordiv(self, a_gpu, b_gpu):
         q, _ = self.divmod(a_gpu, b_gpu)

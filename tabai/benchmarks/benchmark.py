@@ -53,11 +53,26 @@ def _gpu_sync() -> None:
         cp.cuda.Stream.null.synchronize()
 
 
-def _bench(fn: Callable[[], object], warmup: int = 2, repeat: int = 5) -> float:
-    """Run *fn* with warm-up, return the **median** elapsed time in seconds."""
+_TIMEOUT_S = 10.0  # skip an operation if a single call exceeds this
+
+
+def _bench(
+    fn: Callable[[], object],
+    warmup: int = 2,
+    repeat: int = 5,
+    timeout_s: float = _TIMEOUT_S,
+) -> float | None:
+    """Run *fn* with warm-up, return the **median** elapsed time in seconds.
+
+    Returns *None* if any single call (warmup or measurement) exceeds
+    *timeout_s*, so the caller can display a placeholder instead of waiting.
+    """
     for _ in range(warmup):
+        t0 = time.perf_counter()
         fn()
         _gpu_sync()
+        if time.perf_counter() - t0 > timeout_s:
+            return None
     times: list[float] = []
     for _ in range(repeat):
         _gpu_sync()
@@ -65,7 +80,10 @@ def _bench(fn: Callable[[], object], warmup: int = 2, repeat: int = 5) -> float:
         fn()
         _gpu_sync()
         t1 = time.perf_counter()
-        times.append(t1 - t0)
+        elapsed = t1 - t0
+        times.append(elapsed)
+        if elapsed > timeout_s:
+            return None
     return statistics.median(times)
 
 
@@ -171,18 +189,18 @@ class _TabaiBackend:
 # ---------------------------------------------------------------------------
 # Benchmark definitions
 # ---------------------------------------------------------------------------
-BIT_SIZES = [1_000, 10_000, 100_000, 1_000_000]
+BIT_SIZES = [1_000, 10_000, 100_000, 1_000_000, 10_000_000, 100_000_000]
 
-# Division is O(n) Python-level iterations in the current TabaiInt implementation,
-# so 1M bits would be extremely slow.  Use a smaller ceiling for div/mod.
-DIV_BIT_SIZES = [1_000, 10_000, 100_000]
+DIV_BIT_SIZES = [1_000, 10_000, 100_000, 1_000_000, 10_000_000]
 
 # For pow the exponent must be small; otherwise all backends are impractical.
 POW_EXPONENTS = [2, 3, 10]
-POW_BASE_BITS = [1_000, 10_000, 100_000]
+POW_BASE_BITS = [1_000, 10_000, 100_000, 1_000_000, 10_000_000]
 
 
-def _format_time(seconds: float) -> str:
+def _format_time(seconds: float | None) -> str:
+    if seconds is None:
+        return "   >timeout"
     if seconds < 1e-3:
         return f"{seconds * 1e6:>10.1f} us"
     if seconds < 1.0:
@@ -208,13 +226,19 @@ def _run_op_bench(
     run: Callable,
     warmup: int = 2,
     repeat: int = 5,
+    timeout_s: float = _TIMEOUT_S,
 ) -> None:
     col = 14
     row = f"{op_name:<28} {bits:>10}"
     for backend in backends:
         args_raw = make_args(bits)
         args = tuple(backend.from_int(x) for x in args_raw)
-        elapsed = _bench(lambda a=args, r=run, be=backend: r(be, *a), warmup=warmup, repeat=repeat)
+        elapsed = _bench(
+            lambda a=args, r=run, be=backend: r(be, *a),
+            warmup=warmup,
+            repeat=repeat,
+            timeout_s=timeout_s,
+        )
         row += f" {_format_time(elapsed):>{col}}"
     print(row, flush=True)
 
