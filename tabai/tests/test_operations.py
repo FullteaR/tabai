@@ -77,6 +77,109 @@ def test_large_ops(calc, a, b):
     assert gpu_to_int(calc.mul(int_to_gpu(a), int_to_gpu(b))) == a * b
 
 
+# ---------------------------------------------------------------------------
+# Boundary tests for the fused small-kernel path (n <= 256 limbs = 8192 bits)
+# ---------------------------------------------------------------------------
+
+# The fused kernel handles n <= _BLOCK=256 limbs.
+# These bit widths straddle the boundary.
+_SMALL_BITS = 8192   # 256 limbs — last size handled by the fused kernel
+_LARGE_BITS = 8193   # 257 limbs — first size that falls through to the multi-kernel path
+
+
+class TestAddSubBoundary:
+    """Verify correctness at and around the 256-limb fused-kernel boundary."""
+
+    # --- small-kernel side (n <= 256) ---
+
+    def test_add_at_limit(self, calc):
+        a = (1 << (_SMALL_BITS - 1))
+        b = (1 << (_SMALL_BITS - 2))
+        assert gpu_to_int(calc.add(int_to_gpu(a), int_to_gpu(b))) == a + b
+
+    def test_add_carry_chain_fills_256_limbs(self, calc):
+        # All 256 limbs are 0xFFFFFFFF; adding 1 must carry through every limb.
+        a = (1 << _SMALL_BITS) - 1
+        b = 1
+        assert gpu_to_int(calc.add(int_to_gpu(a), int_to_gpu(b))) == 1 << _SMALL_BITS
+
+    def test_add_carry_out_creates_257th_limb(self, calc):
+        # result needs an extra limb beyond 256
+        a = (1 << _SMALL_BITS) - 1
+        b = (1 << _SMALL_BITS) - 1
+        assert gpu_to_int(calc.add(int_to_gpu(a), int_to_gpu(b))) == a + b
+
+    def test_sub_at_limit(self, calc):
+        a = (1 << _SMALL_BITS) - 1
+        b = (1 << (_SMALL_BITS // 2))
+        assert gpu_to_int(calc.sub(int_to_gpu(a), int_to_gpu(b))) == a - b
+
+    def test_sub_borrow_chain_fills_256_limbs(self, calc):
+        # 2^8192 - 1: borrow propagates across all limbs.
+        a = 1 << _SMALL_BITS
+        b = 1
+        assert gpu_to_int(calc.sub(int_to_gpu(a), int_to_gpu(b))) == a - b
+
+    def test_add_asymmetric_sizes_small_path(self, calc):
+        # len(a)=256 limbs, len(b)=1 limb → n=256 (fused kernel)
+        a = (1 << (_SMALL_BITS - 1))
+        b = 1
+        assert gpu_to_int(calc.add(int_to_gpu(a), int_to_gpu(b))) == a + b
+
+    # --- large-kernel side (n > 256) ---
+
+    def test_add_just_above_limit(self, calc):
+        a = 1 << _LARGE_BITS
+        b = 1
+        assert gpu_to_int(calc.add(int_to_gpu(a), int_to_gpu(b))) == a + b
+
+    def test_add_carry_chain_257_limbs(self, calc):
+        a = (1 << _LARGE_BITS) - 1
+        b = 1
+        assert gpu_to_int(calc.add(int_to_gpu(a), int_to_gpu(b))) == 1 << _LARGE_BITS
+
+    def test_sub_just_above_limit(self, calc):
+        a = (1 << _LARGE_BITS) - 1
+        b = (1 << (_LARGE_BITS // 2))
+        assert gpu_to_int(calc.sub(int_to_gpu(a), int_to_gpu(b))) == a - b
+
+    # --- crossing the boundary (one operand each side) ---
+
+    @pytest.mark.parametrize("a_bits,b_bits", [
+        (_SMALL_BITS, 1),          # 256-limb + 1-limb  → n=256 (fused)
+        (_LARGE_BITS, 1),          # 257-limb + 1-limb  → n=257 (multi)
+        (_LARGE_BITS, _SMALL_BITS),# 257-limb + 256-limb → n=257 (multi)
+    ])
+    def test_add_mixed_sizes(self, calc, a_bits, b_bits):
+        a = (1 << (a_bits - 1)) | ((1 << (a_bits // 3)) - 1)
+        b = (1 << (b_bits - 1)) | 1
+        assert gpu_to_int(calc.add(int_to_gpu(a), int_to_gpu(b))) == a + b
+
+    @pytest.mark.parametrize("bits", [
+        _SMALL_BITS - 1,  # well inside fused path
+        _SMALL_BITS,      # exactly at boundary (fused)
+        _SMALL_BITS + 1,  # just outside (multi)
+        _SMALL_BITS + 32, # one full limb past boundary (multi)
+    ])
+    def test_add_random_around_boundary(self, calc, bits):
+        random.seed(bits)
+        a = random.getrandbits(bits) | (1 << (bits - 1))
+        b = random.getrandbits(bits) | (1 << (bits - 1))
+        assert gpu_to_int(calc.add(int_to_gpu(a), int_to_gpu(b))) == a + b
+
+    @pytest.mark.parametrize("bits", [
+        _SMALL_BITS - 1,
+        _SMALL_BITS,
+        _SMALL_BITS + 1,
+        _SMALL_BITS + 32,
+    ])
+    def test_sub_random_around_boundary(self, calc, bits):
+        random.seed(bits)
+        a = random.getrandbits(bits) | (1 << bits)  # ensure a > b
+        b = random.getrandbits(bits) | (1 << (bits - 1))
+        assert gpu_to_int(calc.sub(int_to_gpu(a), int_to_gpu(b))) == a - b
+
+
 class TestNegativeNumbers:
     def test_neg_construction(self):
         assert TabaiInt(-1).to_cpu() == -1

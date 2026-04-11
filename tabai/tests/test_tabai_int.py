@@ -1,4 +1,5 @@
 import pytest
+import random
 from tabai_gpu import TabaiInt
 
 
@@ -168,3 +169,87 @@ def test_pow_small_numbers():
 def test_pow_large():
     a, b = 10**100, 3
     assert (TabaiInt(a) ** TabaiInt(b)).to_cpu() == a ** b
+
+
+# ---------------------------------------------------------------------------
+# Boundary tests for the fused add/sub kernel (256-limb threshold)
+# ---------------------------------------------------------------------------
+
+_SMALL_BITS = 8192   # 256 limbs — fused-kernel path
+_LARGE_BITS = 8193   # 257 limbs — multi-kernel path
+
+
+class TestAddSubBoundary:
+    """Correctness around the 256-limb boundary, exercised through TabaiInt."""
+
+    def test_add_at_limit(self):
+        a = (1 << (_SMALL_BITS - 1))
+        b = (1 << (_SMALL_BITS - 2))
+        assert (TabaiInt(a) + TabaiInt(b)).to_cpu() == a + b
+
+    def test_add_carry_chain_fills_256_limbs(self):
+        a = (1 << _SMALL_BITS) - 1
+        assert (TabaiInt(a) + TabaiInt(1)).to_cpu() == 1 << _SMALL_BITS
+
+    def test_add_carry_out_creates_257th_limb(self):
+        a = (1 << _SMALL_BITS) - 1
+        b = (1 << _SMALL_BITS) - 1
+        assert (TabaiInt(a) + TabaiInt(b)).to_cpu() == a + b
+
+    def test_sub_at_limit(self):
+        a = (1 << _SMALL_BITS) - 1
+        b = (1 << (_SMALL_BITS // 2))
+        assert (TabaiInt(a) - TabaiInt(b)).to_cpu() == a - b
+
+    def test_sub_borrow_chain_fills_256_limbs(self):
+        a = 1 << _SMALL_BITS
+        assert (TabaiInt(a) - TabaiInt(1)).to_cpu() == a - 1
+
+    def test_add_just_above_limit(self):
+        a = 1 << _LARGE_BITS
+        assert (TabaiInt(a) + TabaiInt(1)).to_cpu() == a + 1
+
+    def test_add_carry_chain_257_limbs(self):
+        a = (1 << _LARGE_BITS) - 1
+        assert (TabaiInt(a) + TabaiInt(1)).to_cpu() == 1 << _LARGE_BITS
+
+    def test_sub_just_above_limit(self):
+        a = (1 << _LARGE_BITS) - 1
+        b = (1 << (_LARGE_BITS // 2))
+        assert (TabaiInt(a) - TabaiInt(b)).to_cpu() == a - b
+
+    def test_add_negative_at_limit(self):
+        a = -((1 << _SMALL_BITS) - 1)
+        b = -1
+        assert (TabaiInt(a) + TabaiInt(b)).to_cpu() == a + b
+
+    def test_sub_negative_at_limit(self):
+        a = (1 << _SMALL_BITS) - 1
+        b = -((1 << _SMALL_BITS) - 1)
+        assert (TabaiInt(a) - TabaiInt(b)).to_cpu() == a - b
+
+    @pytest.mark.parametrize("bits", [
+        _SMALL_BITS - 32,
+        _SMALL_BITS - 1,
+        _SMALL_BITS,
+        _SMALL_BITS + 1,
+        _SMALL_BITS + 32,
+    ])
+    def test_add_random_around_boundary(self, bits):
+        random.seed(bits)
+        a = random.getrandbits(bits) | (1 << (bits - 1))
+        b = random.getrandbits(bits) | (1 << (bits - 1))
+        assert (TabaiInt(a) + TabaiInt(b)).to_cpu() == a + b
+
+    @pytest.mark.parametrize("bits", [
+        _SMALL_BITS - 32,
+        _SMALL_BITS - 1,
+        _SMALL_BITS,
+        _SMALL_BITS + 1,
+        _SMALL_BITS + 32,
+    ])
+    def test_sub_random_around_boundary(self, bits):
+        random.seed(bits)
+        a = random.getrandbits(bits) | (1 << bits)
+        b = random.getrandbits(bits) | (1 << (bits - 1))
+        assert (TabaiInt(a) - TabaiInt(b)).to_cpu() == a - b

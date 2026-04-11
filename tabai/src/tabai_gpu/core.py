@@ -90,8 +90,9 @@ void apply_carries(unsigned int* result, const int* states, int n, int is_sub)
             else result[idx] -= 1u;
         }
     } else {
-        if (states[n - 1] == 2 && is_sub == 0) {
-            result[n] = 1u;
+        // idx == n: always write carry-out for add so result can be cp.empty
+        if (is_sub == 0) {
+            result[n] = (states[n - 1] == 2) ? 1u : 0u;
         }
     }
 }
@@ -159,47 +160,165 @@ void shift_left(const unsigned int* src, int src_len,
 }
 ''', 'shift_left')
 
+# Fused add/sub kernel for n <= _BLOCK (single block fits in shared memory).
+# Replaces compute_states + block_scan + apply_carries + find_last_nonzero (4→1 launch).
+# Also writes the trim index to trim_out[0] so _trim's separate kernel is not needed.
+#
+# Shared memory layout (dynamic, all 4-byte elements):
+#   [0 .. BLOCK-1]         int32  buf0  (state ping buffer)
+#   [BLOCK .. 2*BLOCK-1]   int32  buf1  (state pong buffer)
+#   [2*BLOCK .. 3*BLOCK-1] uint32 res   (raw limb results, n ≤ BLOCK slots)
+# Plus one static __shared__ int last_nz for the inline trim reduction.
+_addsub_small_kernel = cp.RawKernel(r'''
+extern "C" __global__
+void addsub_small(
+    const unsigned int* a, int len_a,
+    const unsigned int* b, int len_b,
+    unsigned int* result,
+    int n, int extra, int is_sub,
+    int* trim_out)
+{
+    extern __shared__ int sm[];
+    int* buf0 = sm;
+    int* buf1 = sm + blockDim.x;
+    unsigned int* res = (unsigned int*)(sm + 2 * (int)blockDim.x);
+
+    __shared__ int last_nz;
+
+    int tid = threadIdx.x;
+
+    // Step 1: compute per-limb state and raw result into shared memory
+    if (tid < n) {
+        unsigned long long av = (tid < len_a) ? (unsigned long long)a[tid] : 0ULL;
+        unsigned long long bv = (tid < len_b) ? (unsigned long long)b[tid] : 0ULL;
+        if (is_sub == 0) {
+            unsigned long long s = av + bv;
+            res[tid] = (unsigned int)s;
+            buf0[tid] = (s > 0xFFFFFFFFULL) ? 2 : ((s == 0xFFFFFFFFULL) ? 1 : 0);
+        } else {
+            long long d = (long long)av - (long long)bv;
+            res[tid] = (unsigned int)d;
+            buf0[tid] = (d < 0) ? 2 : ((d == 0) ? 1 : 0);
+        }
+    } else {
+        buf0[tid] = 0;
+    }
+    __syncthreads();
+
+    // Step 2: intra-block prefix scan (double-buffer)
+    int* src = buf0;
+    int* dst = buf1;
+    for (int step = 1; step < (int)blockDim.x; step <<= 1) {
+        if (tid >= step && src[tid] == 1) {
+            dst[tid] = src[tid - step];
+        } else {
+            dst[tid] = src[tid];
+        }
+        __syncthreads();
+        int* tmp = src; src = dst; dst = tmp;
+    }
+    // src now holds the fully propagated states
+
+    // Step 3: apply carry/borrow
+    if (tid > 0 && tid < n && src[tid - 1] == 2) {
+        if (is_sub == 0) res[tid] += 1u;
+        else             res[tid] -= 1u;
+    }
+    __syncthreads();
+
+    // Step 4: write result to global memory + carry-out + inline trim
+    if (tid == 0) {
+        if (extra > 0 && is_sub == 0 && n > 0 && src[n - 1] == 2) {
+            result[n] = 1u;
+            last_nz = n;   // carry-out is the highest non-zero slot
+        } else {
+            if (extra > 0) result[n] = 0u;
+            last_nz = -1;
+        }
+    }
+    __syncthreads();
+
+    if (tid < n) {
+        result[tid] = res[tid];
+        if (res[tid] != 0) atomicMax(&last_nz, tid);
+    }
+    __syncthreads();
+
+    if (tid == 0) trim_out[0] = last_nz;
+}
+''', 'addsub_small')
+
 
 
 class GPUBigInt:
-    def __init__(self, max_bits=1000000):
+    def __init__(self, max_bits=1_000_000):
         self.max_bits = max_bits
+        max_limbs = (max_bits + 31) // 32
 
-    def _scan(self, states, n):
+        # Working buffer for states (large path only)
+        self._states_buf = cp.empty(max_limbs, dtype=cp.int32)
+
+        # Working buffers for scan block_sums at each recursion level
+        self._scan_dummy = cp.empty(1, dtype=cp.int32)
+        self._scan_bufs: list[cp.ndarray] = []
+        size = max_limbs
+        while True:
+            blocks = (size + _BLOCK - 1) // _BLOCK
+            if blocks <= 1:
+                break
+            self._scan_bufs.append(cp.empty(blocks, dtype=cp.int32))
+            size = blocks
+
+        # Trim index buffer shared by both paths
+        self._trim_idx_buf = cp.empty(1, dtype=cp.int32)
+
+    def _scan(self, states, n, _level=0):
         blocks = (n + _BLOCK - 1) // _BLOCK
         smem = 2 * _BLOCK * 4
 
         if blocks == 1:
-            dummy = cp.empty(1, dtype=cp.int32)
-            _block_scan_kernel((1,), (_BLOCK,), (states, dummy, n), shared_mem=smem)
+            _block_scan_kernel((1,), (_BLOCK,), (states, self._scan_dummy, n), shared_mem=smem)
             return
 
-        block_sums = cp.empty(blocks, dtype=cp.int32)
+        if _level < len(self._scan_bufs):
+            block_sums = self._scan_bufs[_level][:blocks]
+        else:
+            block_sums = cp.empty(blocks, dtype=cp.int32)  # fallback for very large inputs
+
         _block_scan_kernel((blocks,), (_BLOCK,), (states, block_sums, n), shared_mem=smem)
-
-        self._scan(block_sums, blocks)
-
+        self._scan(block_sums, blocks, _level + 1)
         _propagate_kernel((blocks,), (_BLOCK,), (states, block_sums, n, _BLOCK))
 
     def _addsub(self, a_gpu, b_gpu, is_sub):
         n = max(len(a_gpu), len(b_gpu))
         extra = 0 if is_sub else 1
-        result = cp.zeros(n + extra, dtype=cp.uint32)
-        states = cp.empty(n, dtype=cp.int32)
+        # cp.empty avoids cudaMemset; all slots are written explicitly by the kernels
+        result = cp.empty(n + extra, dtype=cp.uint32)
 
-        blocks = (n + _BLOCK - 1) // _BLOCK
-        _compute_states_kernel(
-            (blocks,), (_BLOCK,),
-            (a_gpu, len(a_gpu), b_gpu, len(b_gpu), result, states, n, int(is_sub)))
-
-        self._scan(states, n)
-
-        blocks_ext = ((n + extra) + _BLOCK - 1) // _BLOCK
-        _apply_carries_kernel(
-            (blocks_ext,), (_BLOCK,),
-            (result, states, n, int(is_sub)))
-
-        return self._trim(result)
+        if n <= _BLOCK:
+            # Fast path: single fused kernel (compute + carry-propagate + trim)
+            smem = 3 * _BLOCK * 4  # 2 state buffers + 1 result buffer
+            _addsub_small_kernel(
+                (1,), (_BLOCK,),
+                (a_gpu, len(a_gpu), b_gpu, len(b_gpu), result, n, extra, int(is_sub),
+                 self._trim_idx_buf),
+                shared_mem=smem)
+            last = int(self._trim_idx_buf[0])  # single GPU→CPU sync
+            if last < 0:
+                return cp.array([0], dtype=cp.uint32)
+            return result[:last + 1]
+        else:
+            states = self._states_buf[:n]
+            blocks = (n + _BLOCK - 1) // _BLOCK
+            _compute_states_kernel(
+                (blocks,), (_BLOCK,),
+                (a_gpu, len(a_gpu), b_gpu, len(b_gpu), result, states, n, int(is_sub)))
+            self._scan(states, n)
+            blocks_ext = ((n + extra) + _BLOCK - 1) // _BLOCK
+            _apply_carries_kernel(
+                (blocks_ext,), (_BLOCK,),
+                (result, states, n, int(is_sub)))
+            return self._trim(result)
 
     def add(self, a_gpu, b_gpu):
         return self._addsub(a_gpu, b_gpu, False)
@@ -259,10 +378,11 @@ class GPUBigInt:
         n = len(gpu_arr)
         if n == 0:
             return cp.array([0], dtype=cp.uint32)
-        idx_buf = cp.full(1, -1, dtype=cp.int32)
+        # Reset pre-allocated buffer (async, serialized on the null stream)
+        self._trim_idx_buf.fill(-1)
         blocks = (n + _BLOCK - 1) // _BLOCK
-        _find_last_nonzero_kernel((blocks,), (_BLOCK,), (gpu_arr, n, idx_buf))
-        last = int(idx_buf[0])
+        _find_last_nonzero_kernel((blocks,), (_BLOCK,), (gpu_arr, n, self._trim_idx_buf))
+        last = int(self._trim_idx_buf[0])  # GPU→CPU sync
         if last < 0:
             return cp.array([0], dtype=cp.uint32)
         return gpu_arr[:last + 1]
