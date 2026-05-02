@@ -407,17 +407,13 @@ class GPUBigInt:
         result = cp.empty(n + extra, dtype=cp.uint32)
 
         if n <= _BLOCK:
-            # Fast path: single fused kernel (compute + carry-propagate + trim)
+            # Fast path: single fused kernel (compute + carry-propagate).
             smem = 3 * _BLOCK * 4  # 2 state buffers + 1 result buffer
             _addsub_small_kernel(
                 (1,), (_BLOCK,),
                 (a_gpu, len(a_gpu), b_gpu, len(b_gpu), result, n, extra, int(is_sub),
                  self._trim_idx_buf),
                 shared_mem=smem)
-            last = int(self._trim_idx_buf[0])  # single GPU→CPU sync
-            if last < 0:
-                return cp.array([0], dtype=cp.uint32)
-            return result[:last + 1]
         else:
             self._ensure_capacity(n)
             states = self._states_buf[:n]
@@ -430,7 +426,7 @@ class GPUBigInt:
             _apply_carries_kernel(
                 (blocks_ext,), (_BLOCK,),
                 (result, states, n, int(is_sub)))
-            return self._trim(result)
+        return result
 
     def add(self, a_gpu, b_gpu):
         return self._addsub(a_gpu, b_gpu, False)
@@ -552,7 +548,11 @@ class GPUBigInt:
         pad = (-len(out)) % chunks_per_limb
         if pad:
             out = cp.concatenate([out, cp.zeros(pad, dtype=out_dtype)])
-        return self._trim(out.view(cp.uint32))
+        # Conservative trim: product of two numbers needs at most
+        # len(a) + len(b) limbs.  Slice without any GPU→CPU sync.
+        limbs = out.view(cp.uint32)
+        max_limbs = len(a_gpu) + len(b_gpu)
+        return limbs[:max_limbs] if len(limbs) > max_limbs else limbs
 
     def _trim(self, gpu_arr):
         n = len(gpu_arr)
@@ -596,14 +596,14 @@ class GPUBigInt:
         _shift_left_kernel(
             (blocks,), (_BLOCK,),
             (a_gpu, len(a_gpu), result, n, limb_shift, bit_shift))
-        return self._trim(result)
+        return result
 
     def _shift_right_one(self, a_gpu):
         n = len(a_gpu)
         result = cp.empty(n, dtype=cp.uint32)
         blocks = (n + _BLOCK - 1) // _BLOCK
         _shift_right_one_kernel((blocks,), (_BLOCK,), (a_gpu, result, n))
-        return self._trim(result)
+        return result
 
     def _to_int(self, gpu_arr):
         """Convert GPU uint32 little-endian limb array to Python int."""
