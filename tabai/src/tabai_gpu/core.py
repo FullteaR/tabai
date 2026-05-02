@@ -203,6 +203,57 @@ void carry_prop_step(
 }
 ''', 'carry_prop_step')
 
+# ---------------------------------------------------------------------------
+# After fixed-count carry propagation, each element is at most 2^chunk_bits.
+# Extract the 3-state encoding used by the add/sub prefix scan:
+#   2 = generate: this position already carries (value >> chunk_bits == 1)
+#   1 = propagate: low bits are all-ones; adding carry-in 1 would overflow
+#   0 = kill: no carry out regardless of carry-in
+# ---------------------------------------------------------------------------
+_extract_mul_states_kernel = cp.RawKernel(r'''
+extern "C" __global__
+void extract_mul_states(
+    const long long* __restrict__ src,
+    int* __restrict__ states,
+    int n, int chunk_bits)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    long long chunk_mask = (1LL << chunk_bits) - 1LL;
+    long long val = src[idx];
+    int carry = (val >> chunk_bits) ? 1 : 0;
+    long long chunk = val & chunk_mask;
+    if (carry)
+        states[idx] = 2;
+    else if (chunk == chunk_mask)
+        states[idx] = 1;
+    else
+        states[idx] = 0;
+}
+''', 'extract_mul_states')
+
+# ---------------------------------------------------------------------------
+# Apply prefix-scan-resolved carry states back to the int64 chunk array.
+# After this kernel every element fits in exactly chunk_bits bits.
+# ---------------------------------------------------------------------------
+_apply_mul_carries_kernel = cp.RawKernel(r'''
+extern "C" __global__
+void apply_mul_carries(
+    long long* __restrict__ data,
+    const int* __restrict__ states,
+    int n, int chunk_bits)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    long long chunk_mask = (1LL << chunk_bits) - 1LL;
+    long long val = data[idx] & chunk_mask;
+    if (idx > 0 && states[idx - 1] == 2) {
+        val = (val + 1LL) & chunk_mask;
+    }
+    data[idx] = val;
+}
+''', 'apply_mul_carries')
+
 _addsub_small_kernel = cp.RawKernel(r'''
 extern "C" __global__
 void addsub_small(
@@ -453,21 +504,51 @@ class GPUBigInt:
         fa *= fb
         c = cp.fft.irfft(fa, n=n_fft)
 
-        result = cp.zeros(n_fft + 1, dtype=cp.int64)
-        result[:n_fft] = cp.rint(c).astype(cp.int64)
+        # ------------------------------------------------------------------ #
+        # Carry propagation — zero GPU→CPU syncs.
+        #
+        # Step 1: Fixed-count carry_prop_step iterations reduce every
+        #   element from up to ~(log2(n_fft) + 2B) bits down to at most
+        #   2^chunk_bits.  At that point each position's carry is 0 or 1.
+        #
+        # Step 2: Extract 3-state encoding (kill/propagate/generate) and
+        #   resolve carry chains with the same parallel prefix scan used
+        #   for add/sub.  O(log n) work, no GPU→CPU sync.
+        #
+        # Step 3: Apply resolved carries to produce final chunk values.
+        # ------------------------------------------------------------------ #
+        carry_n = n_fft + 1
+        ping = self._fft_carry_ping[:carry_n]
+        pong = self._fft_carry_pong[:carry_n]
+        ping[:n_fft] = cp.rint(c).astype(cp.int64)
+        ping[n_fft] = 0  # carry-out slot
 
-        chunk_mask = cp.int64((1 << chunk_bits) - 1)
-        while True:
-            carries = result >> cp.int64(chunk_bits)
-            result &= chunk_mask
-            if cp.all(carries == 0):
-                break
-            result[1:] += carries[:-1]
+        # Step 1: fixed-count carry reduction (no sync).
+        k = -(-((n_fft.bit_length() - 1) + 2 * chunk_bits) // chunk_bits)
+        blocks_carry = (carry_n + _BLOCK - 1) // _BLOCK
+        for _ in range(k):
+            _carry_prop_step_kernel(
+                (blocks_carry,), (_BLOCK,),
+                (ping, pong, carry_n, chunk_bits))
+            ping, pong = pong, ping
+
+        # Step 2: extract states and prefix-scan (no sync).
+        self._ensure_capacity(carry_n)
+        states = self._states_buf[:carry_n]
+        _extract_mul_states_kernel(
+            (blocks_carry,), (_BLOCK,),
+            (ping, states, carry_n, chunk_bits))
+        self._scan(states, carry_n)
+
+        # Step 3: apply resolved carries (no sync).
+        _apply_mul_carries_kernel(
+            (blocks_carry,), (_BLOCK,),
+            (ping, states, carry_n, chunk_bits))
 
         # Recombine: view small-int array as uint32 limbs.
         out_dtype = cp.uint16 if chunk_bits == 16 else cp.uint8
         chunks_per_limb = 32 // chunk_bits  # 2 for uint16, 4 for uint8
-        out = result.astype(out_dtype)
+        out = ping.astype(out_dtype)
         pad = (-len(out)) % chunks_per_limb
         if pad:
             out = cp.concatenate([out, cp.zeros(pad, dtype=out_dtype)])

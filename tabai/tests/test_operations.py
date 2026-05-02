@@ -593,3 +593,322 @@ class TestMulFFTWorkspace:
         expected = (1 << (2 * n)) - 1
         assert r1 == expected
         assert r2 == expected
+
+
+# ---------------------------------------------------------------------------
+# Edge case tests for GPUBigInt operations
+# ---------------------------------------------------------------------------
+
+class TestAddSubEdgeCases:
+    """Edge cases for add/sub that aren't covered by boundary or exhaustive tests."""
+
+    def test_add_zero_zero(self, calc):
+        assert gpu_to_int(calc.add(int_to_gpu(0), int_to_gpu(0))) == 0
+
+    def test_add_zero_left(self, calc):
+        a = (1 << 1000) + 42
+        assert gpu_to_int(calc.add(int_to_gpu(0), int_to_gpu(a))) == a
+
+    def test_add_zero_right(self, calc):
+        a = (1 << 1000) + 42
+        assert gpu_to_int(calc.add(int_to_gpu(a), int_to_gpu(0))) == a
+
+    def test_sub_to_zero(self, calc):
+        a = (1 << 10000) - 1
+        assert gpu_to_int(calc.sub(int_to_gpu(a), int_to_gpu(a))) == 0
+
+    def test_sub_zero_right(self, calc):
+        a = (1 << 1000) + 42
+        assert gpu_to_int(calc.sub(int_to_gpu(a), int_to_gpu(0))) == a
+
+    def test_add_asymmetric_sizes(self, calc):
+        """One operand much larger than the other."""
+        a = (1 << 50000) - 1  # ~1563 limbs
+        b = 1                  # 1 limb
+        assert gpu_to_int(calc.add(int_to_gpu(a), int_to_gpu(b))) == a + b
+        assert gpu_to_int(calc.add(int_to_gpu(b), int_to_gpu(a))) == a + b
+
+    def test_sub_asymmetric_sizes(self, calc):
+        a = (1 << 50000) - 1
+        b = 1
+        assert gpu_to_int(calc.sub(int_to_gpu(a), int_to_gpu(b))) == a - b
+
+    def test_add_uint32_boundary_values(self, calc):
+        """Values at uint32 limb boundaries."""
+        vals = [2**32 - 1, 2**32, 2**32 + 1, 2**64 - 1, 2**64, 2**64 + 1]
+        for a in vals:
+            for b in vals:
+                assert gpu_to_int(calc.add(int_to_gpu(a), int_to_gpu(b))) == a + b
+
+    def test_sub_uint32_boundary_values(self, calc):
+        vals = [2**32 - 1, 2**32, 2**32 + 1, 2**64 - 1, 2**64, 2**64 + 1]
+        for a in vals:
+            for b in vals:
+                if a >= b:
+                    assert gpu_to_int(calc.sub(int_to_gpu(a), int_to_gpu(b))) == a - b
+
+    def test_add_all_ones_different_lengths(self, calc):
+        """0xFFFF...F + 0xFFFF...F where operands differ in limb count."""
+        a = (1 << 320) - 1    # 10 limbs, all 0xFFFFFFFF
+        b = (1 << 160) - 1    # 5 limbs, all 0xFFFFFFFF
+        assert gpu_to_int(calc.add(int_to_gpu(a), int_to_gpu(b))) == a + b
+
+    def test_sub_leaves_single_bit(self, calc):
+        """Result is exactly a power of 2."""
+        a = (1 << 10000)
+        b = a - 1
+        result = gpu_to_int(calc.sub(int_to_gpu(a), int_to_gpu(b)))
+        assert result == 1
+
+
+class TestMulEdgeCases:
+    """Edge cases for multiplication."""
+
+    def test_mul_zero_zero(self, calc):
+        assert gpu_to_int(calc.mul(int_to_gpu(0), int_to_gpu(0))) == 0
+
+    def test_mul_one_one(self, calc):
+        assert gpu_to_int(calc.mul(int_to_gpu(1), int_to_gpu(1))) == 1
+
+    def test_mul_max_uint32(self, calc):
+        a = 2**32 - 1
+        assert gpu_to_int(calc.mul(int_to_gpu(a), int_to_gpu(a))) == a * a
+
+    def test_mul_power_of_2(self, calc):
+        """Multiplying by a power of 2 is effectively a shift."""
+        a = (1 << 5000) + 123456789
+        b = 1 << 3000
+        assert gpu_to_int(calc.mul(int_to_gpu(a), int_to_gpu(b))) == a * b
+
+    def test_mul_asymmetric_sizes(self, calc):
+        """One operand much larger than the other (both in CPU path)."""
+        a = (1 << 10000) - 1
+        b = 3
+        assert gpu_to_int(calc.mul(int_to_gpu(a), int_to_gpu(b))) == a * b
+
+    def test_mul_asymmetric_sizes_fft(self, calc):
+        """One operand in FFT range, other is small — forces FFT path."""
+        a = (1 << 100000) - 1   # > 2048 limbs
+        b = 7
+        assert gpu_to_int(calc.mul(int_to_gpu(a), int_to_gpu(b))) == a * b
+
+    def test_mul_cpu_fft_threshold(self, calc):
+        """Values right at the CPU/FFT threshold boundary."""
+        # 2048 limbs = 65536 bits → CPU path
+        a_cpu = (1 << 65536) - 1
+        b_cpu = (1 << 65536) - 1
+        assert gpu_to_int(calc.mul(int_to_gpu(a_cpu), int_to_gpu(b_cpu))) == a_cpu * b_cpu
+
+        # 2049 limbs = 65568 bits → FFT path
+        a_fft = (1 << 65568) - 1
+        b_fft = (1 << 65568) - 1
+        assert gpu_to_int(calc.mul(int_to_gpu(a_fft), int_to_gpu(b_fft))) == a_fft * b_fft
+
+    def test_mul_commutativity(self, calc):
+        """a * b == b * a for various sizes."""
+        random.seed(9999)
+        for bits in [100, 5000, 80000]:
+            a = random.getrandbits(bits) | (1 << (bits - 1))
+            b = random.getrandbits(bits) | (1 << (bits - 1))
+            r1 = gpu_to_int(calc.mul(int_to_gpu(a), int_to_gpu(b)))
+            r2 = gpu_to_int(calc.mul(int_to_gpu(b), int_to_gpu(a)))
+            assert r1 == r2
+
+    def test_mul_single_limb_overflow(self, calc):
+        """Products that overflow exactly at limb boundaries."""
+        a = (1 << 32) - 1   # 0xFFFFFFFF
+        b = (1 << 32) - 1
+        expected = a * b     # 0xFFFFFFFE00000001
+        assert gpu_to_int(calc.mul(int_to_gpu(a), int_to_gpu(b))) == expected
+
+    def test_mul_alternating_bits(self, calc):
+        """Alternating bit pattern stresses the FFT differently from all-ones."""
+        n = 80000  # FFT path
+        a = sum(1 << i for i in range(0, n, 2))  # 0x5555...
+        b = sum(1 << i for i in range(1, n, 2))  # 0xAAAA...
+        assert gpu_to_int(calc.mul(int_to_gpu(a), int_to_gpu(b))) == a * b
+
+
+class TestCompareEdgeCases:
+    """Edge cases for GPUBigInt._compare."""
+
+    def test_compare_equal(self, calc):
+        a = (1 << 10000) - 1
+        assert calc._compare(int_to_gpu(a), int_to_gpu(a)) == 0
+
+    def test_compare_zero_zero(self, calc):
+        assert calc._compare(int_to_gpu(0), int_to_gpu(0)) == 0
+
+    def test_compare_differ_in_last_limb(self, calc):
+        """Differ only in the most significant limb."""
+        a = (1 << 10000) + (1 << 9999)
+        b = (1 << 10000)
+        assert calc._compare(int_to_gpu(a), int_to_gpu(b)) == 1
+        assert calc._compare(int_to_gpu(b), int_to_gpu(a)) == -1
+
+    def test_compare_differ_in_first_limb(self, calc):
+        """Differ only in the least significant limb."""
+        base = 1 << 10000
+        a = base + 2
+        b = base + 1
+        assert calc._compare(int_to_gpu(a), int_to_gpu(b)) == 1
+        assert calc._compare(int_to_gpu(b), int_to_gpu(a)) == -1
+
+    def test_compare_different_lengths(self, calc):
+        a = 1 << 10000   # many limbs
+        b = 1             # 1 limb
+        assert calc._compare(int_to_gpu(a), int_to_gpu(b)) == 1
+        assert calc._compare(int_to_gpu(b), int_to_gpu(a)) == -1
+
+    def test_compare_adjacent_values(self, calc):
+        """Consecutive integers that differ by 1."""
+        a = (1 << 5000) - 1
+        b = 1 << 5000
+        assert calc._compare(int_to_gpu(a), int_to_gpu(b)) == -1
+        assert calc._compare(int_to_gpu(b), int_to_gpu(a)) == 1
+
+
+class TestBitLengthEdgeCases:
+
+    def test_bit_length_zero(self, calc):
+        assert calc._bit_length(int_to_gpu(0)) == 0
+
+    def test_bit_length_one(self, calc):
+        assert calc._bit_length(int_to_gpu(1)) == 1
+
+    def test_bit_length_power_of_2(self, calc):
+        for exp in [1, 31, 32, 33, 63, 64, 65, 1000, 10000]:
+            assert calc._bit_length(int_to_gpu(1 << exp)) == exp + 1
+
+    def test_bit_length_power_of_2_minus_1(self, calc):
+        for exp in [1, 31, 32, 33, 63, 64, 65, 1000, 10000]:
+            assert calc._bit_length(int_to_gpu((1 << exp) - 1)) == exp
+
+
+class TestShiftEdgeCases:
+
+    def test_shift_left_zero_bits(self, calc):
+        a = int_to_gpu(42)
+        result = calc._shift_left(a, 0)
+        assert gpu_to_int(result) == 42
+
+    def test_shift_left_by_one(self, calc):
+        a = (1 << 5000) + 1
+        result = gpu_to_int(calc._shift_left(int_to_gpu(a), 1))
+        assert result == a << 1
+
+    def test_shift_left_by_32(self, calc):
+        """Exact limb-aligned shift."""
+        a = (1 << 5000) + 123
+        result = gpu_to_int(calc._shift_left(int_to_gpu(a), 32))
+        assert result == a << 32
+
+    def test_shift_left_by_33(self, calc):
+        """Non-aligned shift crossing limb boundary."""
+        a = (1 << 5000) + 123
+        result = gpu_to_int(calc._shift_left(int_to_gpu(a), 33))
+        assert result == a << 33
+
+    def test_shift_left_large(self, calc):
+        a = (1 << 1000) - 1
+        result = gpu_to_int(calc._shift_left(int_to_gpu(a), 5000))
+        assert result == a << 5000
+
+    def test_shift_right_one_basic(self, calc):
+        a = 1024
+        result = gpu_to_int(calc._shift_right_one(int_to_gpu(a)))
+        assert result == 512
+
+    def test_shift_right_one_odd(self, calc):
+        """Shifting an odd number truncates the lowest bit."""
+        a = (1 << 5000) + 1
+        result = gpu_to_int(calc._shift_right_one(int_to_gpu(a)))
+        assert result == a >> 1
+
+    def test_shift_right_one_all_ones(self, calc):
+        a = (1 << 10000) - 1
+        result = gpu_to_int(calc._shift_right_one(int_to_gpu(a)))
+        assert result == a >> 1
+
+    def test_shift_right_one_power_of_2(self, calc):
+        a = 1 << 10000
+        result = gpu_to_int(calc._shift_right_one(int_to_gpu(a)))
+        assert result == a >> 1
+
+    def test_shift_right_one_one(self, calc):
+        result = gpu_to_int(calc._shift_right_one(int_to_gpu(1)))
+        assert result == 0
+
+
+class TestDivmodEdgeCases:
+
+    def test_divmod_equal(self, calc):
+        a = (1 << 5000) - 1
+        q, r = calc.divmod(int_to_gpu(a), int_to_gpu(a))
+        assert gpu_to_int(q) == 1
+        assert gpu_to_int(r) == 0
+
+    def test_divmod_dividend_less_than_divisor(self, calc):
+        a = 5
+        b = (1 << 5000) - 1
+        q, r = calc.divmod(int_to_gpu(a), int_to_gpu(b))
+        assert gpu_to_int(q) == 0
+        assert gpu_to_int(r) == a
+
+    def test_divmod_by_one(self, calc):
+        a = (1 << 10000) + 42
+        q, r = calc.divmod(int_to_gpu(a), int_to_gpu(1))
+        assert gpu_to_int(q) == a
+        assert gpu_to_int(r) == 0
+
+    def test_divmod_by_zero_raises(self, calc):
+        with pytest.raises(ZeroDivisionError):
+            calc.divmod(int_to_gpu(42), int_to_gpu(0))
+
+    def test_divmod_power_of_2_divisor(self, calc):
+        a = (1 << 10000) + 999
+        b = 1 << 100
+        q, r = calc.divmod(int_to_gpu(a), int_to_gpu(b))
+        assert gpu_to_int(q) == a // b
+        assert gpu_to_int(r) == a % b
+
+    def test_divmod_large_quotient_small_remainder(self, calc):
+        b = (1 << 1000) + 3
+        a = b * 12345 + 7
+        q, r = calc.divmod(int_to_gpu(a), int_to_gpu(b))
+        assert gpu_to_int(q) == 12345
+        assert gpu_to_int(r) == 7
+
+    def test_divmod_exact_division(self, calc):
+        b = (1 << 2000) + 17
+        a = b * 9999
+        q, r = calc.divmod(int_to_gpu(a), int_to_gpu(b))
+        assert gpu_to_int(q) == 9999
+        assert gpu_to_int(r) == 0
+
+    def test_divmod_zero_dividend(self, calc):
+        q, r = calc.divmod(int_to_gpu(0), int_to_gpu(42))
+        assert gpu_to_int(q) == 0
+        assert gpu_to_int(r) == 0
+
+
+class TestUtilsRoundtrip:
+    """int_to_gpu / gpu_to_int roundtrip edge cases."""
+
+    @pytest.mark.parametrize("val", [
+        0, 1, 2,
+        2**16 - 1, 2**16, 2**16 + 1,
+        2**31 - 1, 2**31, 2**31 + 1,
+        2**32 - 1, 2**32, 2**32 + 1,
+        2**64 - 1, 2**64, 2**64 + 1,
+        2**128 - 1,
+        (1 << 10000) - 1, 1 << 10000,
+    ])
+    def test_roundtrip(self, val):
+        assert gpu_to_int(int_to_gpu(val)) == val
+
+    def test_roundtrip_random(self):
+        random.seed(54321)
+        for bits in [1, 8, 16, 31, 32, 33, 64, 128, 1000, 10000]:
+            val = random.getrandbits(bits)
+            assert gpu_to_int(int_to_gpu(val)) == val
