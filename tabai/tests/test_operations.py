@@ -5,6 +5,9 @@ from tabai_gpu.core import GPUBigInt
 from tabai_gpu.utils import int_to_gpu, gpu_to_int
 from tabai_gpu.tabai_int import TabaiInt
 
+import sys
+sys.set_int_max_str_digits(0)
+
 @pytest.fixture
 def calc():
     return GPUBigInt()
@@ -446,3 +449,147 @@ class TestIntInterop:
         assert (b - TabaiInt(a)).to_cpu() == b - a
         assert (TabaiInt(a) * b).to_cpu() == a * b
         assert (b * TabaiInt(a)).to_cpu() == b * a
+
+
+# ---------------------------------------------------------------------------
+# Tests for the Phase 1+2+4 mul optimisation
+# (fixed-count carry propagation kernel + pre-allocated FFT workspace)
+#
+# Correctness is verified with identities whose expected values can be
+# computed cheaply without full Python big-int multiplication:
+#
+#   Identity P:  2^n * 2^m  =  2^(n+m)
+#   Identity D:  (2^n + 1) * (2^n - 1)  =  2^(2n) - 1
+#   Identity A:  a * 2  ==  a + a
+#
+# Carry-stress test:  (2^n - 1) * (2^n - 1)
+#   All uint16/uint8 chunks are at their maximum value, producing the
+#   largest possible FFT convolution coefficients and the deepest carry
+#   chains — the hardest case for the fixed-count carry loop.
+#
+# Boundary sizes used:
+#   _FFT_B16_BITS  — inside the B=16 path  (n_fft_est < 2^20)
+#   _FFT_B8_BITS   — inside the B= 8 path  (n_fft_est ≥ 2^20)
+# ---------------------------------------------------------------------------
+
+# Just above the CPU-path threshold (2048 limbs = 65536 bits) so that
+# the FFT path is exercised while Python * can still verify correctness.
+_FFT_ENTRY_BITS = 70_000   # ~2188 limbs — smallest FFT-path size, B=16
+_FFT_B16_BITS   = 500_000  # B=16 path, moderately sized FFT
+_FFT_B8_BITS    = 5_000_000  # B=8 path  (n_fft_est ≥ 2^20)
+
+
+class TestMulFFTCarryProp:
+    """Correctness of the fixed-count carry propagation kernel (Phase 1+2)."""
+
+    # -- Identity P: 2^n * 2^m = 2^(n+m) ----------------------------------
+
+    @pytest.mark.parametrize("bits", [
+        _FFT_ENTRY_BITS,
+        _FFT_B16_BITS,
+        _FFT_B8_BITS,
+    ], ids=["entry", "b16", "b8"])
+    def test_power_of_2_product(self, calc, bits):
+        n = bits // 2
+        m = bits - n
+        result = gpu_to_int(calc.mul(int_to_gpu(1 << n), int_to_gpu(1 << m)))
+        assert result == (1 << (n + m))
+
+    # -- Identity D: (2^n + 1)(2^n - 1) = 2^(2n) - 1 ----------------------
+
+    @pytest.mark.parametrize("bits", [
+        _FFT_ENTRY_BITS,
+        _FFT_B16_BITS,
+        _FFT_B8_BITS,
+    ], ids=["entry", "b16", "b8"])
+    def test_diff_of_squares(self, calc, bits):
+        n = bits // 2
+        a_val = (1 << n) + 1
+        b_val = (1 << n) - 1
+        result = gpu_to_int(calc.mul(int_to_gpu(a_val), int_to_gpu(b_val)))
+        assert result == (1 << (2 * n)) - 1
+
+    # -- Identity A: a * 2 == a + a  (self-consistency) --------------------
+
+    @pytest.mark.parametrize("bits", [
+        _FFT_ENTRY_BITS,
+        _FFT_B16_BITS,
+        _FFT_B8_BITS,
+    ], ids=["entry", "b16", "b8"])
+    def test_mul2_equals_add(self, calc, bits):
+        random.seed(bits)
+        a_int = random.getrandbits(bits) | (1 << (bits - 1))
+        a = int_to_gpu(a_int)
+        result_mul = gpu_to_int(calc.mul(a, int_to_gpu(2)))
+        result_add = gpu_to_int(calc.add(a, a))
+        assert result_mul == result_add
+
+    # -- Carry-stress: all-ones maximises FFT coefficient magnitude ---------
+
+    @pytest.mark.parametrize("bits", [
+        _FFT_ENTRY_BITS,
+        _FFT_B16_BITS,
+    ], ids=["entry", "b16"])
+    def test_all_ones_carry_stress(self, calc, bits):
+        """(2^n - 1)^2 produces maximum convolution coefficients."""
+        a_int = (1 << bits) - 1
+        result = gpu_to_int(calc.mul(int_to_gpu(a_int), int_to_gpu(a_int)))
+        assert result == a_int * a_int
+
+    # -- B=16 / B=8 chunk boundary -----------------------------------------
+
+    @pytest.mark.parametrize("n", [
+        1_900_000,  # well inside B=16 region
+        2_100_000,  # just above estimated crossover (n_fft_est ≈ 2^22, B=8)
+        4_000_000,  # clearly B=8
+    ], ids=["1.9Mbit", "2.1Mbit", "4Mbit"])
+    def test_chunk_boundary_power_of_2(self, calc, n):
+        """Power-of-2 product straddling the B=16 / B=8 transition."""
+        result = gpu_to_int(calc.mul(int_to_gpu(1 << n), int_to_gpu(1 << n)))
+        assert result == (1 << (2 * n))
+
+
+class TestMulFFTWorkspace:
+    """Correctness of pre-allocated FFT workspace reuse (Phase 4)."""
+
+    def test_buffer_grows_with_input_size(self):
+        """Sequential multiplications with increasing size must all be correct."""
+        calc = GPUBigInt()
+        for bits in [_FFT_ENTRY_BITS, _FFT_B16_BITS, _FFT_B8_BITS]:
+            n = bits // 2
+            result = gpu_to_int(calc.mul(int_to_gpu(1 << n), int_to_gpu(1 << n)))
+            assert result == (1 << (2 * n)), f"failed at {bits} bits"
+
+    def test_buffer_reused_gives_same_result(self):
+        """Two calls with identical inputs must return the same value (no stale data)."""
+        calc = GPUBigInt()
+        bits = _FFT_B16_BITS
+        n = bits // 2
+        a_gpu = int_to_gpu((1 << n) + 1)
+        b_gpu = int_to_gpu((1 << n) - 1)
+        r1 = gpu_to_int(calc.mul(a_gpu, b_gpu))
+        r2 = gpu_to_int(calc.mul(a_gpu, b_gpu))
+        expected = (1 << (2 * n)) - 1
+        assert r1 == expected
+        assert r2 == expected
+
+    def test_descending_then_ascending_size(self):
+        """Buffer should handle sizes that fluctuate (grow, shrink, grow)."""
+        calc = GPUBigInt()
+        sizes = [_FFT_B8_BITS, _FFT_ENTRY_BITS, _FFT_B16_BITS, _FFT_B8_BITS]
+        for bits in sizes:
+            n = bits // 2
+            result = gpu_to_int(calc.mul(int_to_gpu(1 << n), int_to_gpu(1 << n)))
+            assert result == (1 << (2 * n)), f"failed at {bits} bits"
+
+    def test_workspace_shared_across_tabaiint_operations(self):
+        """TabaiInt uses a module-level shared GPUBigInt; sequential muls must be correct."""
+        bits = _FFT_B16_BITS
+        n = bits // 2
+        a = TabaiInt((1 << n) + 1)
+        b = TabaiInt((1 << n) - 1)
+        r1 = (a * b).to_cpu()
+        r2 = (a * b).to_cpu()
+        expected = (1 << (2 * n)) - 1
+        assert r1 == expected
+        assert r2 == expected

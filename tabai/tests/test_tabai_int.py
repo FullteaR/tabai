@@ -2,6 +2,9 @@ import pytest
 import random
 from tabai_gpu import TabaiInt
 
+import sys
+sys.set_int_max_str_digits(0)
+
 
 def test_add_1_1():
     assert (TabaiInt(1) + TabaiInt(1)).to_cpu() == 2

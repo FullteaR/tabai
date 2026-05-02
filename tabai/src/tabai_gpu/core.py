@@ -3,6 +3,13 @@ import numpy as np
 
 _BLOCK = 256
 
+# For mul operands whose combined size is at most this many limbs, delegate to
+# Python's built-in int * (Karatsuba) instead of launching cuFFT.  The cuFFT
+# pipeline costs ~1 ms regardless of input size (kernel-launch + plan overhead),
+# while Python int * for 64 K-bit operands is ~900 µs and for 1 K-bit is ~2 µs.
+# The crossover (FFT faster than Python) is around 80 K bits per operand.
+_MUL_CPU_THRESHOLD_LIMBS = 2048  # 65536 bits per operand
+
 _compute_states_kernel = cp.RawKernel(r'''
 extern "C" __global__
 void compute_states(
@@ -170,6 +177,32 @@ void shift_left(const unsigned int* src, int src_len,
 #   [BLOCK .. 2*BLOCK-1]   int32  buf1  (state pong buffer)
 #   [2*BLOCK .. 3*BLOCK-1] uint32 res   (raw limb results, n ≤ BLOCK slots)
 # Plus one static __shared__ int last_nz for the inline trim reduction.
+# ---------------------------------------------------------------------------
+# Carry propagation kernel for FFT-based multiplication (Phase 2).
+#
+# One "global parallel" iteration of carry propagation over a chunk array:
+#   dst[i] = (src[i] & chunk_mask) + (src[i-1] >> chunk_bits)
+#
+# src and dst must be different arrays (ping-pong).  All reads from src
+# happen before any writes to dst (separate arrays → no data hazard).
+# Equivalent to one iteration of the original Python carry loop but
+# without any GPU→CPU synchronisation.
+# ---------------------------------------------------------------------------
+_carry_prop_step_kernel = cp.RawKernel(r'''
+extern "C" __global__
+void carry_prop_step(
+    const long long* __restrict__ src,
+    long long* __restrict__ dst,
+    int n, int chunk_bits)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    long long chunk_mask = (1LL << chunk_bits) - 1LL;
+    long long carry_in = (idx > 0) ? (src[idx - 1] >> chunk_bits) : 0LL;
+    dst[idx] = (src[idx] & chunk_mask) + carry_in;
+}
+''', 'carry_prop_step')
+
 _addsub_small_kernel = cp.RawKernel(r'''
 extern "C" __global__
 void addsub_small(
@@ -257,6 +290,12 @@ class GPUBigInt:
         self._trim_idx_buf = cp.empty(1, dtype=cp.int32)
         self._states_buf = cp.empty(0, dtype=cp.int32)  # grown lazily
         self._scan_bufs: list[cp.ndarray] = []
+        # Phase 4: pre-allocated FFT workspace — avoids cudaMalloc per mul call.
+        # Grown lazily by _ensure_fft_capacity(); never shrunk.
+        self._fft_buf_a = cp.empty(0, dtype=cp.float64)
+        self._fft_buf_b = cp.empty(0, dtype=cp.float64)
+        self._fft_carry_ping = cp.empty(0, dtype=cp.int64)
+        self._fft_carry_pong = cp.empty(0, dtype=cp.int64)
         self._ensure_capacity((max_bits + 31) // 32)
 
     def _ensure_capacity(self, n: int) -> None:
@@ -276,6 +315,22 @@ class GPUBigInt:
                 break
             self._scan_bufs.append(cp.empty(blocks, dtype=cp.int32))
             size = blocks
+
+    def _ensure_fft_capacity(self, n_fft: int) -> None:
+        """Grow pre-allocated FFT workspace buffers to handle transforms of size n_fft.
+
+        Allocates:
+          - Two float64 buffers of length n_fft  (FFT input pads for a and b).
+          - Two int64 carry ping-pong buffers of length n_fft + 1  (one carry-out
+            slot beyond the n_fft convolution coefficients).
+        Reallocation is amortised: buffers grow but never shrink.
+        """
+        if n_fft <= len(self._fft_buf_a):
+            return
+        self._fft_buf_a = cp.empty(n_fft, dtype=cp.float64)
+        self._fft_buf_b = cp.empty(n_fft, dtype=cp.float64)
+        self._fft_carry_ping = cp.empty(n_fft + 1, dtype=cp.int64)
+        self._fft_carry_pong = cp.empty(n_fft + 1, dtype=cp.int64)
 
     def _scan(self, states, n, _level=0):
         blocks = (n + _BLOCK - 1) // _BLOCK
@@ -334,6 +389,16 @@ class GPUBigInt:
 
     def mul(self, a_gpu, b_gpu):
         # ------------------------------------------------------------------ #
+        # Fast path: small operands — Python int * beats cuFFT for < 64 K bits
+        # ------------------------------------------------------------------ #
+        if len(a_gpu) <= _MUL_CPU_THRESHOLD_LIMBS and len(b_gpu) <= _MUL_CPU_THRESHOLD_LIMBS:
+            a_np = cp.asnumpy(a_gpu).astype(np.uint32)
+            b_np = cp.asnumpy(b_gpu).astype(np.uint32)
+            a_int = int.from_bytes(a_np.tobytes(), 'little')
+            b_int = int.from_bytes(b_np.tobytes(), 'little')
+            return self._from_int(a_int * b_int)
+
+        # ------------------------------------------------------------------ #
         # Adaptive chunk width to maintain float64 precision.
         #
         # The FFT convolution computes coefficients whose maximum magnitude is
@@ -372,10 +437,16 @@ class GPUBigInt:
         while n_fft < n_conv:
             n_fft <<= 1
 
-        a_f = cp.zeros(n_fft, dtype=cp.float64)
-        b_f = cp.zeros(n_fft, dtype=cp.float64)
+        # Phase 4: ensure pre-allocated workspace is large enough (no malloc per call).
+        self._ensure_fft_capacity(n_fft)
+
+        # Phase 4: reuse pre-allocated float64 pads — clear only the padding region.
+        a_f = self._fft_buf_a[:n_fft]
+        b_f = self._fft_buf_b[:n_fft]
         a_f[:n_a] = a_chunks.astype(cp.float64)
+        a_f[n_a:] = 0
         b_f[:n_b] = b_chunks.astype(cp.float64)
+        b_f[n_b:] = 0
 
         fa = cp.fft.rfft(a_f)
         fb = cp.fft.rfft(b_f)

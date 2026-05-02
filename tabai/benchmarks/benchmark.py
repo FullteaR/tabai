@@ -40,11 +40,23 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+_GETRANDBITS_MAX = 1 << 29  # random.getrandbits is limited to ~2^31 on most platforms
+
+
 def _random_int(bits: int) -> int:
     """Return a random positive integer with exactly *bits* bits."""
     if bits <= 0:
         return 0
-    return random.getrandbits(bits) | (1 << (bits - 1))
+    if bits <= _GETRANDBITS_MAX:
+        return random.getrandbits(bits) | (1 << (bits - 1))
+    # Build from chunks (MSB first so the shift arithmetic is simple).
+    result = 0
+    remaining = bits
+    while remaining > 0:
+        n = min(remaining, _GETRANDBITS_MAX)
+        result = (result << n) | random.getrandbits(n)
+        remaining -= n
+    return result | (1 << (bits - 1))
 
 
 def _gpu_sync() -> None:
@@ -64,12 +76,15 @@ def _bench(
 ) -> float | None:
     """Run *fn* with warm-up, return the **median** elapsed time in seconds.
 
-    Returns *None* if any single call (warmup or measurement) exceeds
-    *timeout_s*, so the caller can display a placeholder instead of waiting.
+    Returns *None* if any single call times out or raises an exception
+    (e.g. GPU out-of-memory), so the caller can display a placeholder.
     """
     for _ in range(warmup):
         t0 = time.perf_counter()
-        fn()
+        try:
+            fn()
+        except Exception:
+            return None
         _gpu_sync()
         if time.perf_counter() - t0 > timeout_s:
             return None
@@ -77,7 +92,10 @@ def _bench(
     for _ in range(repeat):
         _gpu_sync()
         t0 = time.perf_counter()
-        fn()
+        try:
+            fn()
+        except Exception:
+            return None
         _gpu_sync()
         t1 = time.perf_counter()
         elapsed = t1 - t0
@@ -189,12 +207,14 @@ class _TabaiBackend:
 # ---------------------------------------------------------------------------
 # Benchmark definitions
 # ---------------------------------------------------------------------------
-BIT_SIZES = [1_000, 10_000, 100_000, 1_000_000, 10_000_000, 100_000_000]
+BIT_SIZES     = [1_000, 10_000, 100_000, 1_000_000, 10_000_000, 100_000_000,
+                 1_000_000_000, 10_000_000_000]
 
-DIV_BIT_SIZES = [1_000, 10_000, 100_000, 1_000_000, 10_000_000]
+DIV_BIT_SIZES = [1_000, 10_000, 100_000, 1_000_000, 10_000_000, 100_000_000,
+                 1_000_000_000]
 
 # For pow the exponent must be small; otherwise all backends are impractical.
-POW_EXPONENTS = [2, 3, 10]
+POW_EXPONENTS = [2, 3, 10, 20]
 POW_BASE_BITS = [1_000, 10_000, 100_000, 1_000_000, 10_000_000]
 
 
@@ -224,13 +244,20 @@ def _run_op_bench(
     backends: list[object],
     make_args: Callable,
     run: Callable,
+    skip_backends: set[str] | None = None,
     warmup: int = 2,
     repeat: int = 5,
     timeout_s: float = _TIMEOUT_S,
-) -> None:
+) -> set[str]:
+    """Run one benchmark row. Returns the set of backend names that timed out
+    (or OOM'd) at this bit size so callers can skip them for larger sizes."""
     col = 14
     row = f"{op_name:<28} {bits:>10}"
+    newly_timed_out: set[str] = set()
     for backend in backends:
+        if skip_backends and backend.name in skip_backends:
+            row += f" {'--':>{col}}"
+            continue
         args_raw = make_args(bits)
         args = tuple(backend.from_int(x) for x in args_raw)
         elapsed = _bench(
@@ -239,8 +266,11 @@ def _run_op_bench(
             repeat=repeat,
             timeout_s=timeout_s,
         )
+        if elapsed is None:
+            newly_timed_out.add(backend.name)
         row += f" {_format_time(elapsed):>{col}}"
     print(row, flush=True)
+    return newly_timed_out
 
 
 # ---------------------------------------------------------------------------
@@ -269,84 +299,76 @@ def main() -> None:
 
     # --- addition -----------------------------------------------------------
     _print_header(backends)
+    timed_out: set[str] = set()
     for bits in BIT_SIZES:
-        _run_op_bench(
-            "add",
-            bits,
-            backends,
+        timed_out |= _run_op_bench(
+            "add", bits, backends,
             make_args=lambda b: (_random_int(b), _random_int(b)),
             run=lambda be, a, b: be.add(a, b),
+            skip_backends=timed_out,
         )
     print()
 
     # --- subtraction --------------------------------------------------------
     _print_header(backends)
+    timed_out = set()
     for bits in BIT_SIZES:
-        _run_op_bench(
-            "sub (a > b)",
-            bits,
-            backends,
-            make_args=lambda b: (
-                _random_int(b) | (1 << b),
-                _random_int(b),
-            ),
+        timed_out |= _run_op_bench(
+            "sub (a > b)", bits, backends,
+            make_args=lambda b: (_random_int(b) | (1 << b), _random_int(b)),
             run=lambda be, a, b: be.sub(a, b),
+            skip_backends=timed_out,
         )
     print()
 
     # --- multiplication -----------------------------------------------------
     _print_header(backends)
+    timed_out = set()
     for bits in BIT_SIZES:
-        _run_op_bench(
-            "mul",
-            bits,
-            backends,
+        timed_out |= _run_op_bench(
+            "mul", bits, backends,
             make_args=lambda b: (_random_int(b), _random_int(b)),
             run=lambda be, a, b: be.mul(a, b),
+            skip_backends=timed_out,
         )
     print()
 
     # --- floor division -----------------------------------------------------
     _print_header(backends)
+    timed_out = set()
     for bits in DIV_BIT_SIZES:
-        _run_op_bench(
-            "floordiv",
-            bits,
-            backends,
-            make_args=lambda b: (
-                _random_int(b),
-                _random_int(max(b // 2, 1)),
-            ),
+        timed_out |= _run_op_bench(
+            "floordiv", bits, backends,
+            make_args=lambda b: (_random_int(b), _random_int(max(b // 2, 1))),
             run=lambda be, a, b: be.floordiv(a, b),
+            skip_backends=timed_out,
         )
     print()
 
     # --- modulo -------------------------------------------------------------
     _print_header(backends)
+    timed_out = set()
     for bits in DIV_BIT_SIZES:
-        _run_op_bench(
-            "mod",
-            bits,
-            backends,
-            make_args=lambda b: (
-                _random_int(b),
-                _random_int(max(b // 2, 1)),
-            ),
+        timed_out |= _run_op_bench(
+            "mod", bits, backends,
+            make_args=lambda b: (_random_int(b), _random_int(max(b // 2, 1))),
             run=lambda be, a, b: be.mod(a, b),
+            skip_backends=timed_out,
         )
     print()
 
     # --- pow ----------------------------------------------------------------
     print("pow  (base bits x exponent)")
     _print_header(backends)
+    # Track timeouts per exponent value independently.
+    timed_out_by_exp: dict[int, set[str]] = {e: set() for e in POW_EXPONENTS}
     for base_bits in POW_BASE_BITS:
         for exp in POW_EXPONENTS:
-            _run_op_bench(
-                f"pow (exp={exp})",
-                base_bits,
-                backends,
+            timed_out_by_exp[exp] |= _run_op_bench(
+                f"pow (exp={exp})", base_bits, backends,
                 make_args=lambda b, e=exp: (_random_int(b), e),
                 run=lambda be, a, b: be.pow(a, b),
+                skip_backends=timed_out_by_exp[exp],
             )
     print()
 
