@@ -892,6 +892,80 @@ class TestDivmodEdgeCases:
         assert gpu_to_int(r) == 0
 
 
+class TestDivmodNewtonPath:
+    """divmod above _DIV_NEWTON_THRESHOLD_LIMBS (~64K bits) routes to the GPU
+    Newton reciprocal.  These cases exercise that path against Python's exact
+    divmod across a range of operand shapes that have historically trapped
+    Newton-style algorithms."""
+
+    # Sizes here must stay above _DIV_NEWTON_THRESHOLD_LIMBS so the GPU Newton
+    # path is exercised, not the CPU shortcut.
+    @pytest.mark.parametrize("a_bits,b_bits", [
+        (500_000, 250_000),
+        (500_000, 499_999),   # b nearly equal to a → small quotient
+        (500_000, 10_000),    # b ≪ a → very large quotient
+        (1_000_000, 500_000),
+        (2_000_000, 1_000_000),
+    ], ids=lambda v: f"{v}")
+    def test_random_pair_matches_python(self, calc, a_bits, b_bits):
+        random.seed(a_bits * 7919 + b_bits)
+        a = (1 << (a_bits - 1)) | _rand_bits(a_bits - 1)
+        b = (1 << (b_bits - 1)) | _rand_bits(b_bits - 1)
+        q, r = calc.divmod(int_to_gpu(a), int_to_gpu(b))
+        eq, er = divmod(a, b)
+        assert gpu_to_int(q) == eq
+        assert gpu_to_int(r) == er
+
+    def test_b_is_power_of_2(self, calc):
+        # Power-of-2 b is a worst case for the float64 seed: only one bit set,
+        # so b_top + 1 collapses to the next power of 2.
+        a = _rand_bits(800_000) | (1 << 799_999)
+        b = 1 << 400_000
+        q, r = calc.divmod(int_to_gpu(a), int_to_gpu(b))
+        assert gpu_to_int(q) == a // b
+        assert gpu_to_int(r) == a % b
+
+    def test_b_all_ones(self, calc):
+        # b = 2^k - 1 maximizes b's top 53 bits, stressing the seed scaling.
+        a = _rand_bits(800_000) | (1 << 799_999)
+        b = (1 << 400_000) - 1
+        q, r = calc.divmod(int_to_gpu(a), int_to_gpu(b))
+        assert gpu_to_int(q) == a // b
+        assert gpu_to_int(r) == a % b
+
+    def test_a_just_above_b(self, calc):
+        # Quotient is exactly 1 with a small remainder — the post-Newton
+        # one-sided correction path needs to handle this without underflow.
+        b = _rand_bits(500_000) | (1 << 499_999)
+        a = b + 1
+        q, r = calc.divmod(int_to_gpu(a), int_to_gpu(b))
+        assert gpu_to_int(q) == 1
+        assert gpu_to_int(r) == 1
+
+    def test_exact_multiple(self, calc):
+        # r should be exactly 0 — verifies no spurious +1 correction.
+        b = _rand_bits(500_000) | (1 << 499_999)
+        k = _rand_bits(300_000) | (1 << 299_999)
+        a = b * k
+        q, r = calc.divmod(int_to_gpu(a), int_to_gpu(b))
+        assert gpu_to_int(q) == k
+        assert gpu_to_int(r) == 0
+
+
+def _rand_bits(n: int) -> int:
+    """random.getrandbits substitute that works for n > 2**31."""
+    if n <= 0:
+        return 0
+    chunk = 1 << 29
+    out = 0
+    remaining = n
+    while remaining > 0:
+        k = min(remaining, chunk)
+        out = (out << k) | random.getrandbits(k)
+        remaining -= k
+    return out
+
+
 class TestUtilsRoundtrip:
     """int_to_gpu / gpu_to_int roundtrip edge cases."""
 

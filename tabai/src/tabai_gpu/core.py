@@ -10,6 +10,12 @@ _BLOCK = 256
 # The crossover (FFT faster than Python) is around 80 K bits per operand.
 _MUL_CPU_THRESHOLD_LIMBS = 2048  # 65536 bits per operand
 
+# divmod's reciprocal step. Below this size, computing floor(2^p / b) with
+# Python's int // is faster than running ~log2(p/53) GPU FFT mul iterations.
+# Above it, the CPU step dominates the whole divmod and the GPU Newton path wins.
+# The threshold sits at the empirical crossover (~380 Kbit) for a/b with b≈a/2.
+_DIV_NEWTON_THRESHOLD_LIMBS = 12288  # ~393 Kbits
+
 _compute_states_kernel = cp.RawKernel(r'''
 extern "C" __global__
 void compute_states(
@@ -622,6 +628,83 @@ class GPUBigInt:
         arr_np = np.frombuffer(b, dtype=np.uint32)
         return cp.asarray(arr_np)
 
+    def _reciprocal(self, b_gpu, p):
+        """Return floor(2^p / b) as a uint32 GPU array.
+
+        Dispatches to the GPU Newton path for large p, otherwise computes the
+        reciprocal on the CPU with Python big-int division.  Caller must
+        guarantee b > 0 and p % 32 == 0.
+        """
+        b = self._trim(b_gpu)
+        n_b = self._bit_length(b)
+        if p < n_b:
+            return cp.array([0], dtype=cp.uint32)
+
+        # Newton needs at least 53 bits of headroom below p to seed from float64.
+        # In other regimes the result has only a handful of bits anyway, so CPU //
+        # is the right tool.
+        if p < n_b + 53 or p // 32 <= _DIV_NEWTON_THRESHOLD_LIMBS:
+            b_int = self._to_int(b)
+            return self._from_int((1 << p) // b_int)
+        return self._newton_reciprocal(b, p, n_b)
+
+    def _newton_reciprocal(self, b, p, n_b):
+        """Compute floor(2^p / b) on the GPU via Newton iteration.
+
+        Iteration:  x_{k+1} = floor(x_k * (2*2^p - b*x_k) / 2^p).
+
+        The seed x_0 is chosen below 2^p / b (uses ceil of b's top 53 bits as
+        denominator), and every step floors after the >> p shift.  Together this
+        keeps x_k <= floor(2^p / b) at every iteration, so the loop converges
+        monotonically from below to the exact floor.  After convergence, a
+        bounded tail loop applies any remaining +1 corrections (typically zero)
+        to guarantee exactness.
+
+        Preconditions: b is trimmed, b > 0, p % 32 == 0, p >= n_b + 53.
+        """
+        p_limbs = p // 32
+
+        # Seed x_0 from the top 53 bits of b.  Using b_top + 1 in the denominator
+        # bounds x_0 from above by 2^p / b (the inequality b <= (b_top+1) * 2^(n_b-53)
+        # gives 2^p/b >= 2^(p-n_b+53)/(b_top+1) >= inv_top << (p-n_b-53)).
+        b_int = self._to_int(b)
+        b_top = b_int >> (n_b - 53)
+        inv_top = (1 << 106) // (b_top + 1)
+        x = self._from_int(inv_top << (p - n_b - 53))
+
+        # 2 * 2^p = 2^(p+1) on the GPU: a single bit set in limb p_limbs.
+        two_p_plus_1 = cp.zeros(p_limbs + 1, dtype=cp.uint32)
+        two_p_plus_1[p_limbs] = 2
+
+        # Newton from below doubles correct bits per iteration; ceil(log2(p/53))
+        # iterations suffice.  Cap generously and let the fixed-point check exit.
+        max_iters = max(8, p.bit_length())
+        for _ in range(max_iters):
+            bx = self.mul(b, x)                       # b*x <= 2^p
+            diff = self.sub(two_p_plus_1, bx)         # 2*2^p - b*x in [2^p, 2^(p+1))
+            prod = self.mul(x, diff)
+            if len(prod) > p_limbs:
+                x_new = self._trim(prod[p_limbs:])    # >> p is a free slice
+            else:
+                x_new = cp.array([0], dtype=cp.uint32)
+            if self._compare(x_new, x) == 0:
+                break
+            x = x_new
+
+        # Defensive exact-floor adjustment: if (x+1)*b <= 2^p, x was one short.
+        # In practice this branch is taken zero or one time after convergence.
+        one = cp.array([1], dtype=cp.uint32)
+        two_p = cp.zeros(p_limbs + 1, dtype=cp.uint32)
+        two_p[p_limbs] = 1
+        for _ in range(4):
+            x_plus = self.add(x, one)
+            bx_plus = self.mul(b, x_plus)
+            if self._compare(bx_plus, two_p) <= 0:
+                x = x_plus
+            else:
+                break
+        return x
+
     def divmod(self, a_gpu, b_gpu):
         b = self._trim(b_gpu)
         a = self._trim(a_gpu)
@@ -641,13 +724,10 @@ class GPUBigInt:
         p_limbs = (a_bits + 31) // 32
         p = p_limbs * 32
 
-        # Compute reciprocal x = floor(2^p / b) using Python integer arithmetic.
-        # Python's big-int // uses fast algorithms (Karatsuba etc.) internally.
-        # The round-trip (GPU→CPU→GPU) is justified: b is transferred once, x once,
-        # while all expensive multiplications (a*x, q0*b) stay on the GPU.
-        b_cpu = self._to_int(b)
-        x_cpu = (1 << p) // b_cpu
-        x = self._from_int(x_cpu)
+        # Compute reciprocal x = floor(2^p / b).  Below the threshold, Python's
+        # big-int // is faster than launching ~25 GPU FFT muls; above it the
+        # GPU Newton path wins by a wide margin.
+        x = self._reciprocal(b, p)
 
         # q0 = floor(a * x / 2^p)
         # Since p = p_limbs * 32, the right-shift is a free array slice (little-endian).
