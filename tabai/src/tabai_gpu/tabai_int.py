@@ -13,9 +13,9 @@ def _is_zero(gpu: cp.ndarray) -> bool:
 
 
 class TabaiInt:
-    def __init__(self, value: int | cp.ndarray, sign: int = 1):
+    def __init__(self, value: int | cp.ndarray, sign: int = 1, *, _trimmed: bool = False):
         if isinstance(value, cp.ndarray):
-            self._gpu = value
+            self._gpu = value if _trimmed else _shared_gpu_big_int._trim(value)
             self._sign = sign
         else:
             self._sign = -1 if value < 0 else 1
@@ -37,11 +37,11 @@ class TabaiInt:
 
     def __neg__(self) -> TabaiInt:
         if _is_zero(self._gpu):
-            return TabaiInt(self._gpu.copy(), 1)
-        return TabaiInt(self._gpu.copy(), -self._sign)
+            return TabaiInt(self._gpu.copy(), 1, _trimmed=True)
+        return TabaiInt(self._gpu.copy(), -self._sign, _trimmed=True)
 
     def __abs__(self) -> TabaiInt:
-        return TabaiInt(self._gpu.copy(), 1)
+        return TabaiInt(self._gpu.copy(), 1, _trimmed=True)
 
     def __add__(self, other: TabaiInt | int) -> TabaiInt:
         other = self._coerce(other)
@@ -69,9 +69,9 @@ class TabaiInt:
         other = self._coerce(other)
         if other is NotImplemented:
             return NotImplemented
+        if _is_zero(self._gpu) or _is_zero(other._gpu):
+            return TabaiInt(0)
         result = _shared_gpu_big_int.mul(self._gpu, other._gpu)
-        if _is_zero(result):
-            return TabaiInt(result, 1)
         return TabaiInt(result, self._sign * other._sign)
 
     def __floordiv__(self, other: TabaiInt | int) -> TabaiInt:
@@ -95,9 +95,9 @@ class TabaiInt:
         q_gpu, r_gpu = _shared_gpu_big_int.divmod(self._gpu, other._gpu)
         if _is_zero(r_gpu):
             sign = 1 if _is_zero(q_gpu) else self._sign * other._sign
-            return TabaiInt(q_gpu, sign), TabaiInt(0)
+            return TabaiInt(q_gpu, sign, _trimmed=True), TabaiInt(0)
         if self._sign == other._sign:
-            return TabaiInt(q_gpu, 1), TabaiInt(r_gpu, self._sign)
+            return TabaiInt(q_gpu, 1, _trimmed=True), TabaiInt(r_gpu, self._sign, _trimmed=True)
         one = cp.array([1], dtype=cp.uint32)
         q_adj = _shared_gpu_big_int.add(q_gpu, one)
         r_adj = _shared_gpu_big_int.sub(other._gpu, r_gpu)
