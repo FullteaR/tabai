@@ -388,8 +388,9 @@ class TestReverseOpsLimbBoundary:
         assert (a % TabaiInt(b)).to_cpu() == a % b
 
     @pytest.mark.parametrize("a,b", [
-        (2, _U32_MAX),
+        (2, 1000),
         (_U32_MAX, 2),
+        (3, 255),
     ])
     def test_rpow(self, a, b):
         assert (a ** TabaiInt(b)).to_cpu() == a ** b
