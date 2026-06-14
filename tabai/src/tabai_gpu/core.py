@@ -3,6 +3,8 @@ import numpy as np
 
 _BLOCK = 256
 
+_ONE = cp.array([1], dtype=cp.uint32)
+
 # For mul operands whose combined size is at most this many limbs, delegate to
 # Python's built-in int * (Karatsuba) instead of launching cuFFT.  The cuFFT
 # pipeline costs ~1 ms regardless of input size (kernel-launch + plan overhead),
@@ -130,14 +132,26 @@ void compare_arrays(
     const unsigned int* b, int len_b,
     unsigned long long* result, int n)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n) return;
-    unsigned int av = (idx < len_a) ? a[idx] : 0u;
-    unsigned int bv = (idx < len_b) ? b[idx] : 0u;
-    if (av != bv) {
-        unsigned long long enc = ((unsigned long long)(unsigned int)(idx + 1) << 1)
-                                 | ((av > bv) ? 1ULL : 0ULL);
-        atomicMax(result, enc);
+    __shared__ unsigned long long block_max;
+    int tid = threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + tid;
+
+    if (tid == 0) block_max = 0ULL;
+    __syncthreads();
+
+    if (idx < n) {
+        unsigned int av = (idx < len_a) ? a[idx] : 0u;
+        unsigned int bv = (idx < len_b) ? b[idx] : 0u;
+        if (av != bv) {
+            unsigned long long enc = ((unsigned long long)(unsigned int)(idx + 1) << 1)
+                                     | ((av > bv) ? 1ULL : 0ULL);
+            atomicMax(&block_max, enc);
+        }
+    }
+    __syncthreads();
+
+    if (tid == 0 && block_max != 0ULL) {
+        atomicMax(result, block_max);
     }
 }
 ''', 'compare_arrays')
@@ -345,6 +359,7 @@ class GPUBigInt:
     def __init__(self, max_bits=1_000_000):
         self._scan_dummy = cp.empty(1, dtype=cp.int32)
         self._trim_idx_buf = cp.empty(1, dtype=cp.int32)
+        self._compare_buf = cp.empty(1, dtype=cp.uint64)
         self._states_buf = cp.empty(0, dtype=cp.int32)  # grown lazily
         self._scan_bufs: list[cp.ndarray] = []
         # Phase 4: pre-allocated FFT workspace — avoids cudaMalloc per mul call.
@@ -575,12 +590,12 @@ class GPUBigInt:
 
     def _compare(self, a_gpu, b_gpu):
         n = max(len(a_gpu), len(b_gpu))
-        result_buf = cp.zeros(1, dtype=cp.uint64)
+        self._compare_buf.fill(0)
         blocks = (n + _BLOCK - 1) // _BLOCK
         _compare_kernel(
             (blocks,), (_BLOCK,),
-            (a_gpu, len(a_gpu), b_gpu, len(b_gpu), result_buf, n))
-        val = int(result_buf[0])
+            (a_gpu, len(a_gpu), b_gpu, len(b_gpu), self._compare_buf, n))
+        val = int(self._compare_buf[0])
         if val == 0:
             return 0
         return 1 if (val & 1) else -1
@@ -649,55 +664,112 @@ class GPUBigInt:
         return self._newton_reciprocal(b, p, n_b)
 
     def _newton_reciprocal(self, b, p, n_b):
-        """Compute floor(2^p / b) on the GPU via Newton iteration.
+        """Compute floor(2^p / b) via doubling-precision Newton iteration.
 
-        Iteration:  x_{k+1} = floor(x_k * (2*2^p - b*x_k) / 2^p).
+        A fixed-precision Newton needs ~log2(p/53) iterations, each a full
+        scale-p multiply: ~log2(p) * M(p) work.  This version ramps the working
+        precision so early iterations are cheap, costing only ~constant * M(p).
 
-        The seed x_0 is chosen below 2^p / b (uses ceil of b's top 53 bits as
-        denominator), and every step floors after the >> p shift.  Together this
-        keeps x_k <= floor(2^p / b) at every iteration, so the loop converges
-        monotonically from below to the exact floor.  After convergence, a
-        bounded tail loop applies any remaining +1 corrections (typically zero)
-        to guarantee exactness.
+        The whole computation tracks x as an approximation of the real value
+        2^e/b at a "b-exponent" e that is always a multiple of 32.  Because b is
+        only ever truncated by dropping whole low limbs (b_trunc = floor(b/2^d),
+        d a multiple of 32), every working scale stays 32-bit aligned, so each
+        ">> scale" is a free little-endian array slice.  Framing x by its
+        b-exponent makes the per-step change of truncation transparent: a
+        differently-truncated b_trunc still approximates the same real 2^e/b.
+
+        Steps:
+          1. Exact CPU base seed (~64 quotient bits) from a small top slice of b.
+             Being an exact floor division, the seed is fully accurate to its
+             width (no leading-bit deficit), so accuracy doubles cleanly.
+          2. Ramp: double the quotient precision each step via one Newton step,
+             truncating b to just enough top limbs to cover the new precision.
+          3. Finish: full-b, scale-p fixed-point iteration (the original proven
+             iteration).  Newton maps x = r*(1+e) to r*(1-e^2) <= r*, so it
+             self-corrects any overshoot the truncated ramp introduced and
+             converges to the exact floor from below in ~1-2 iterations.
+          4. Defensive +1 adjustment for an exact floor (same as before).
 
         Preconditions: b is trimmed, b > 0, p % 32 == 0, p >= n_b + 53.
         """
         p_limbs = p // 32
 
-        # Seed x_0 from the top 53 bits of b.  Using b_top + 1 in the denominator
-        # bounds x_0 from above by 2^p / b (the inequality b <= (b_top+1) * 2^(n_b-53)
-        # gives 2^p/b >= 2^(p-n_b+53)/(b_top+1) >= inv_top << (p-n_b-53)).
-        b_int = self._to_int(b)
-        b_top = b_int >> (n_b - 53)
-        inv_top = (1 << 106) // (b_top + 1)
-        x = self._from_int(inv_top << (p - n_b - 53))
+        # For tiny divisors the limb bookkeeping below has too little headroom;
+        # defer to the CPU path (this regime is never the Newton threshold).
+        if n_b < 64:
+            b_int = self._to_int(b)
+            return self._from_int((1 << p) // b_int)
 
-        # 2 * 2^p = 2^(p+1) on the GPU: a single bit set in limb p_limbs.
+        nb_limbs = len(b)          # b is trimmed, little-endian uint32
+        target_q = p - n_b         # bit length of floor(2^p / b)
+        GUARD = 3                  # extra top limbs of b kept beyond x precision
+
+        def b_top(kb):
+            """Top kb limbs of b as (int value, dropped low-bit count d)."""
+            kb = min(nb_limbs, max(1, kb))
+            d = (nb_limbs - kb) * 32
+            return self._to_int(b[nb_limbs - kb:]), d
+
+        # ---- Step 1: exact CPU base seed (~64 quotient bits) ----------------
+        q0 = min(target_q, 64)
+        ex = ((n_b + q0 + 31) // 32) * 32          # b-exponent, 32-aligned, <= p
+        b_trunc_int, d = b_top((q0 + 31) // 32 + GUARD)
+        x = self._from_int((1 << (ex - d)) // b_trunc_int)
+
+        # ---- Step 2: doubling-precision ramp --------------------------------
+        while ex < p:
+            q_next = 2 * (ex - n_b)
+            ex_next = ((n_b + q_next + 31) // 32) * 32
+            if ex_next > p:
+                ex_next = p
+
+            # Lift x to the new b-exponent: x ~ 2^ex/b  ->  2^ex_next/b.
+            # In little-endian, << is prepending low zero limbs.
+            shift_limbs = (ex_next - ex) // 32
+            if shift_limbs:
+                x = cp.concatenate([cp.zeros(shift_limbs, dtype=cp.uint32), x])
+
+            # Truncate b to the top kb limbs (a slice view; no host transfer —
+            # the ramp Newton step is all on the GPU, unlike the base seed).
+            q_field = ex_next - n_b
+            kb = (q_field + 31) // 32 + GUARD
+            if kb >= nb_limbs:
+                b_trunc, d = b, 0
+            else:
+                b_trunc = b[nb_limbs - kb:]
+                d = (nb_limbs - kb) * 32
+            s = ex_next - d            # scale w.r.t. b_trunc, 32-aligned
+            s_limbs = s // 32
+
+            # One Newton step at scale s: x <- floor(x*(2^(s+1) - b_trunc*x)/2^s)
+            bx = self.mul(b_trunc, x)
+            two = cp.zeros(s_limbs + 1, dtype=cp.uint32)
+            two[s_limbs] = 2
+            diff = self.sub(two, bx)
+            prod = self.mul(x, diff)
+            x = self._trim(prod[s_limbs:]) if len(prod) > s_limbs \
+                else cp.array([0], dtype=cp.uint32)
+
+            ex = ex_next
+
+        # ---- Step 3: full-scale fixed-point finish (exact, from below) ------
         two_p_plus_1 = cp.zeros(p_limbs + 1, dtype=cp.uint32)
         two_p_plus_1[p_limbs] = 2
-
-        # Newton from below doubles correct bits per iteration; ceil(log2(p/53))
-        # iterations suffice.  Cap generously and let the fixed-point check exit.
-        max_iters = max(8, p.bit_length())
-        for _ in range(max_iters):
-            bx = self.mul(b, x)                       # b*x <= 2^p
-            diff = self.sub(two_p_plus_1, bx)         # 2*2^p - b*x in [2^p, 2^(p+1))
+        for _ in range(6):
+            bx = self.mul(b, x)
+            diff = self.sub(two_p_plus_1, bx)
             prod = self.mul(x, diff)
-            if len(prod) > p_limbs:
-                x_new = self._trim(prod[p_limbs:])    # >> p is a free slice
-            else:
-                x_new = cp.array([0], dtype=cp.uint32)
+            x_new = self._trim(prod[p_limbs:]) if len(prod) > p_limbs \
+                else cp.array([0], dtype=cp.uint32)
             if self._compare(x_new, x) == 0:
                 break
             x = x_new
 
-        # Defensive exact-floor adjustment: if (x+1)*b <= 2^p, x was one short.
-        # In practice this branch is taken zero or one time after convergence.
-        one = cp.array([1], dtype=cp.uint32)
+        # ---- Step 4: defensive +1 adjustment (uses original b) --------------
         two_p = cp.zeros(p_limbs + 1, dtype=cp.uint32)
         two_p[p_limbs] = 1
         for _ in range(4):
-            x_plus = self.add(x, one)
+            x_plus = self.add(x, _ONE)
             bx_plus = self.mul(b, x_plus)
             if self._compare(bx_plus, two_p) <= 0:
                 x = x_plus
@@ -745,7 +817,7 @@ class GPUBigInt:
         # q0 may be off by 1 (too low): if r >= b, correct once.
         if self._compare(r, b) >= 0:
             r = self.sub(r, b)
-            q0 = self.add(q0, cp.array([1], dtype=cp.uint32))
+            q0 = self.add(q0, _ONE)
 
         return self._trim(q0), self._trim(r)
 
