@@ -16,12 +16,12 @@ _ONE = cp.array([1], dtype=cp.uint32)
 # the schoolbook/NTT crossover is L ~= 6016 limbs.  Below it schoolbook wins
 # (~1.75x at L=3072); asymmetric operands of equal work win by more, so la*lb is
 # a conservative routing metric.  isqrt(threshold) == 6016 exactly.  (It rose
-# from 5120 with the FFT->NTT switch: the NTT's forward-transform floor is a
-# touch higher, so schoolbook stays ahead a little further.)
+# from 5120 when the float transform was replaced by the NTT: the NTT's
+# forward-transform floor is a touch higher, so schoolbook stays ahead further.)
 _MUL_SCHOOLBOOK_MAX_WORK = 6016 * 6016  # la*lb limb-pairs (36_192_256)
 
 # divmod's reciprocal step. Below this size, computing floor(2^p / b) with
-# Python's int // is faster than running ~log2(p/53) GPU FFT mul iterations.
+# Python's int // is faster than running ~log2(p/53) GPU NTT mul iterations.
 # Above it, the CPU step dominates the whole divmod and the GPU Newton path wins.
 # The threshold sits at the empirical crossover (~164 Kbit) for a/b with b≈a/2.
 # It dropped from 12288 after the faster mul (schoolbook + squaring) and the
@@ -34,8 +34,8 @@ _DIV_NEWTON_THRESHOLD_LIMBS = 5120  # ~164 Kbits
 # top-slice (no host sync): a stray zero limb makes the next small mul only
 # marginally wider, and skipping ~log2(p/64) find_last_nonzero D2H syncs is the
 # larger saving.  At or above it we _trim instead — there the extra limb can
-# push the (now large) next mul past an FFT transform-length boundary and double
-# its cost, which dwarfs the single sync the trim spends.  Swept crossover.
+# push the (now large) next mul past a transform-length power-of-two boundary
+# and double its cost, which dwarfs the single sync the trim spends.  Swept.
 _NEWTON_RAMP_TRIM_LIMBS = 40000
 
 _compute_states_kernel = cp.RawKernel(r'''
@@ -218,7 +218,7 @@ void shift_left(const unsigned int* src, int src_len,
 #   [2*BLOCK .. 3*BLOCK-1] uint32 res   (raw limb results, n ≤ BLOCK slots)
 # Plus one static __shared__ int last_nz for the inline trim reduction.
 # ---------------------------------------------------------------------------
-# Carry propagation kernel for FFT-based multiplication (Phase 2).
+# Carry propagation kernel for transform-based multiplication.
 #
 # One "global parallel" iteration of carry propagation over a chunk array:
 #   dst[i] = (src[i] & chunk_mask) + (src[i-1] >> chunk_bits)
@@ -303,7 +303,7 @@ void apply_mul_carries(
 # so the int64 accumulator is safe (min_chunks << 2^31 for any operand we route
 # here — capped by _MUL_SCHOOLBOOK_MAX_WORK).  The int64 column sums feed the
 # same carry-resolution pipeline (carry_prop_step / extract / scan / apply) as
-# the FFT path, so no GPU->CPU roundtrip ever occurs.
+# the NTT path, so no GPU->CPU roundtrip ever occurs.
 # ---------------------------------------------------------------------------
 _schoolbook_mul16_kernel = cp.RawKernel(r'''
 extern "C" __global__
@@ -414,16 +414,16 @@ void addsub_small(
 # ===========================================================================
 # NTT-based multiplication over the Goldilocks prime p = 2^64 - 2^32 + 1.
 #
-# Replaces the float64 FFT convolution with exact modular arithmetic: every
-# coefficient is computed mod p, so there is no rounding and the product is
-# exact at any size (unlike the FFT path, which had to shrink the chunk width
-# to keep IFFT coefficients inside float64's exact-integer range).
+# Every coefficient is computed mod p, so there is no rounding and the product
+# is exact at any size — unlike a float convolution, which has to shrink the
+# chunk width at scale to keep the inverse-transform coefficients inside
+# float64's exact-integer range.
 #
 # p has 2-adicity 32 (p-1 = 2^32 * (2^32-1)), so any power-of-two transform
 # length up to 2^32 has a primitive root; 7 is a primitive root of p.  128->64
 # bit reduction uses 2^64 = 2^32-1 and 2^96 = -1 (mod p) — a couple of branches
 # and one multiply, no Montgomery/Barrett.  Column sums land in one uint64 and
-# feed the same carry-resolution pipeline as the schoolbook/FFT paths.
+# feed the same carry-resolution pipeline as the schoolbook path.
 # ---------------------------------------------------------------------------
 _GL_P = (1 << 64) - (1 << 32) + 1        # 0xFFFFFFFF00000001, prime
 _GL_PRIMITIVE_ROOT = 7
@@ -560,12 +560,10 @@ class GPUBigInt:
         self._compare_buf = cp.empty(1, dtype=cp.uint64)
         self._states_buf = cp.empty(0, dtype=cp.int32)  # grown lazily
         self._scan_bufs: list[cp.ndarray] = []
-        # Phase 4: pre-allocated FFT workspace — avoids cudaMalloc per mul call.
-        # Grown lazily by _ensure_fft_capacity(); never shrunk.
-        self._fft_buf_a = cp.empty(0, dtype=cp.float64)
-        self._fft_buf_b = cp.empty(0, dtype=cp.float64)
-        self._fft_carry_ping = cp.empty(0, dtype=cp.int64)
-        self._fft_carry_pong = cp.empty(0, dtype=cp.int64)
+        # int64 carry ping-pong buffers, shared by the schoolbook and NTT mul
+        # paths.  Grown lazily by _ensure_carry_capacity(); never shrunk.
+        self._carry_ping = cp.empty(0, dtype=cp.int64)
+        self._carry_pong = cp.empty(0, dtype=cp.int64)
         # NTT workspace (uint64 mod-p coefficient pads) and twiddle-table cache
         # keyed by transform length n.  Grown lazily by _ensure_ntt_capacity().
         self._ntt_buf_a = cp.empty(0, dtype=cp.uint64)
@@ -594,27 +592,14 @@ class GPUBigInt:
     def _ensure_carry_capacity(self, carry_n: int) -> None:
         """Grow the int64 carry ping-pong buffers to hold carry_n chunk sums.
 
-        Shared by both the FFT and the schoolbook mul paths (Phase 2 split them
-        from the float64 FFT pads so the schoolbook path never allocates the
-        pads it does not use).  Amortised: grows but never shrinks.
+        Shared by the schoolbook and NTT mul paths (both write base-2^16 column
+        sums here for the carry-resolution pipeline).  Amortised: grows but
+        never shrinks.
         """
-        if carry_n <= len(self._fft_carry_ping):
+        if carry_n <= len(self._carry_ping):
             return
-        self._fft_carry_ping = cp.empty(carry_n, dtype=cp.int64)
-        self._fft_carry_pong = cp.empty(carry_n, dtype=cp.int64)
-
-    def _ensure_fft_capacity(self, n_fft: int) -> None:
-        """Grow pre-allocated FFT workspace buffers to handle transforms of size n_fft.
-
-        Allocates two float64 buffers of length n_fft (FFT input pads for a and
-        b) and, via _ensure_carry_capacity, the int64 carry ping-pong buffers of
-        length n_fft + 1 (one carry-out slot beyond the n_fft coefficients).
-        Reallocation is amortised: buffers grow but never shrink.
-        """
-        if n_fft > len(self._fft_buf_a):
-            self._fft_buf_a = cp.empty(n_fft, dtype=cp.float64)
-            self._fft_buf_b = cp.empty(n_fft, dtype=cp.float64)
-        self._ensure_carry_capacity(n_fft + 1)
+        self._carry_ping = cp.empty(carry_n, dtype=cp.int64)
+        self._carry_pong = cp.empty(carry_n, dtype=cp.int64)
 
     def _ensure_ntt_capacity(self, n: int) -> None:
         """Grow the uint64 NTT coefficient pads (and the shared int64 carry
@@ -629,8 +614,8 @@ class GPUBigInt:
 
         w_fwd[k] = w_n^k and w_inv[k] = w_n^-k for k in [0, n/2), where w_n is a
         primitive n-th root of unity mod p; inv_n = n^-1 mod p (Python int).
-        Cached per n like a cuFFT plan — the roots are generated once on the GPU
-        by the square-and-multiply fill kernel."""
+        Cached per n like a transform plan — the roots are generated once on the
+        GPU by the square-and-multiply fill kernel."""
         cached = self._ntt_tables.get(n)
         if cached is not None:
             return cached
@@ -686,11 +671,11 @@ class GPUBigInt:
     def _mul_ntt(self, a_gpu, b_gpu, is_square=False):
         """Exact big-integer multiply via NTT over the Goldilocks prime.
 
-        Same contract as _mul_fft: uint32 little-endian limb arrays in, a uint32
-        limb array (<= la+lb limbs) out.  16-bit chunks are convolved mod p (no
-        rounding, exact at any size), then the resulting base-2^16 column sums
-        run through the shared carry-resolution pipeline.  is_square (a_gpu is
-        b_gpu) does one forward transform and squares it pointwise."""
+        uint32 little-endian limb arrays in, a uint32 limb array (<= la+lb
+        limbs) out.  16-bit chunks are convolved mod p (no rounding, exact at
+        any size), then the resulting base-2^16 column sums run through the
+        shared carry-resolution pipeline.  is_square (a_gpu is b_gpu) does one
+        forward transform and squares it pointwise."""
         chunk_bits = 16
         a_ch = cp.ascontiguousarray(a_gpu).view(cp.uint16)
         b_ch = a_ch if is_square else cp.ascontiguousarray(b_gpu).view(cp.uint16)
@@ -725,7 +710,7 @@ class GPUBigInt:
         # Feed the exact column sums into the shared carry pipeline.
         carry_n = n + 1
         self._ensure_carry_capacity(carry_n)   # before slicing the ping buffer
-        ping = self._fft_carry_ping[:carry_n]
+        ping = self._carry_ping[:carry_n]
         ping[:n] = fa            # uint64 -> int64 cast; values < 2^63 (see assert)
         ping[n] = 0              # carry-out slot
         max_bits = 2 * chunk_bits + min(n_a, n_b).bit_length()
@@ -823,7 +808,7 @@ class GPUBigInt:
         """Resolve base-2^chunk_bits column sums into final chunk values.
 
         The caller must have already written the (arbitrary-magnitude) int64
-        column sums into self._fft_carry_ping[:carry_n], including a zeroed
+        column sums into self._carry_ping[:carry_n], including a zeroed
         carry-out slot at the top.  Returns the buffer (ping or pong, depending
         on iteration parity) whose first carry_n int64 elements each hold a
         value < 2^chunk_bits.  Zero GPU->CPU syncs.
@@ -832,8 +817,8 @@ class GPUBigInt:
         sum; it fixes the number of carry_prop_step iterations.  Over-estimating
         is harmless (once every element is < 2^chunk_bits the step is a no-op).
         """
-        ping = self._fft_carry_ping[:carry_n]
-        pong = self._fft_carry_pong[:carry_n]
+        ping = self._carry_ping[:carry_n]
+        pong = self._carry_pong[:carry_n]
         blocks_carry = (carry_n + _BLOCK - 1) // _BLOCK
 
         # Step 1: fixed-count carry reduction (no sync).
@@ -878,14 +863,14 @@ class GPUBigInt:
 
     def _mul_schoolbook(self, a_gpu, b_gpu):
         # base-2^16 column sums straight into the carry buffer, then the shared
-        # carry-resolution pipeline.  No FFT, no host roundtrip.
+        # carry-resolution pipeline.  No transform, no host roundtrip.
         chunk_bits = 16
         la, lb = len(a_gpu), len(b_gpu)
         na16, nb16 = 2 * la, 2 * lb
         n_cols = na16 + nb16 - 1
         carry_n = n_cols + 1
         self._ensure_carry_capacity(carry_n)
-        ping = self._fft_carry_ping[:carry_n]
+        ping = self._carry_ping[:carry_n]
 
         blocks = (n_cols + _BLOCK - 1) // _BLOCK
         _schoolbook_mul16_kernel(
@@ -899,83 +884,6 @@ class GPUBigInt:
         max_bits = 2 * chunk_bits + n_terms.bit_length()
         ping = self._resolve_carries(carry_n, chunk_bits, max_bits)
         return self._recombine_chunks(ping, carry_n, chunk_bits, la + lb)
-
-    def _mul_fft(self, a_gpu, b_gpu, is_square=False):
-        # ------------------------------------------------------------------ #
-        # Adaptive chunk width to maintain float64 precision.
-        #
-        # The FFT convolution computes coefficients whose maximum magnitude is
-        # bounded by  n_fft × (2^B - 1)^2 ≈ n_fft × 2^(2B).
-        # float64 can represent integers up to 2^53 exactly, so safe rounding
-        # of the IFFT output requires:
-        #
-        #   n_fft × 2^(2B) < 2^52   (1 bit headroom for FFT rounding errors)
-        #
-        # With B = 16:  safe when n_fft < 2^20  (~4M-bit operands).
-        # With B =  8:  safe when n_fft < 2^36  (operands up to ~10 Gbits).
-        #
-        # Estimate n_fft using the worst case (B = 16) to decide which path
-        # to take; the actual n_fft for B = 8 is 2× larger but still safe.
-        # ------------------------------------------------------------------ #
-        n_chunks_16_est = (len(a_gpu) + len(b_gpu)) * 2
-        n_fft_est = 1
-        while n_fft_est < n_chunks_16_est:
-            n_fft_est <<= 1
-
-        if n_fft_est < (1 << 20):
-            chunk_bits = 16
-            # uint32 viewed as uint16 gives [lo, hi] per limb (little-endian)
-            a_chunks = cp.ascontiguousarray(a_gpu).view(cp.uint16)
-            b_chunks = cp.ascontiguousarray(b_gpu).view(cp.uint16)
-        else:
-            chunk_bits = 8
-            # uint32 viewed as uint8 gives [b0, b1, b2, b3] per limb
-            a_chunks = cp.ascontiguousarray(a_gpu).view(cp.uint8)
-            b_chunks = cp.ascontiguousarray(b_gpu).view(cp.uint8)
-
-        n_a = len(a_chunks)
-        n_b = len(b_chunks)
-        n_conv = n_a + n_b - 1
-        n_fft = 1
-        while n_fft < n_conv:
-            n_fft <<= 1
-
-        # ensure pre-allocated workspace is large enough (no malloc per call).
-        self._ensure_fft_capacity(n_fft)
-
-        # reuse pre-allocated float64 pads — clear only the padding region.
-        a_f = self._fft_buf_a[:n_fft]
-        # Cast on assignment (uint16/uint8 view -> float64 slice) — avoids an
-        # extra full-size .astype() temporary per operand.
-        a_f[:n_a] = a_chunks
-        a_f[n_a:] = 0
-
-        fa = cp.fft.rfft(a_f)
-        if is_square:
-            # Phase 3: squaring — the second operand is identical, so its pad
-            # fill and forward transform are redundant.  fa*fa is the transform
-            # of the self-convolution.
-            fa *= fa
-        else:
-            b_f = self._fft_buf_b[:n_fft]
-            b_f[:n_b] = b_chunks
-            b_f[n_b:] = 0
-            fb = cp.fft.rfft(b_f)
-            fa *= fb
-        c = cp.fft.irfft(fa, n=n_fft)
-
-        # Carry propagation — zero GPU→CPU syncs (shared pipeline).
-        carry_n = n_fft + 1
-        ping = self._fft_carry_ping[:carry_n]
-        cp.rint(c, out=c)      # round in place (c is our own irfft output)
-        ping[:n_fft] = c       # cast float64 -> int64 on assignment (values exact)
-        ping[n_fft] = 0  # carry-out slot
-
-        max_bits = (n_fft.bit_length() - 1) + 2 * chunk_bits
-        ping = self._resolve_carries(carry_n, chunk_bits, max_bits)
-        # Conservative trim: product needs at most len(a) + len(b) limbs.
-        return self._recombine_chunks(ping, carry_n, chunk_bits,
-                                      len(a_gpu) + len(b_gpu))
 
     def _trim_z(self, gpu_arr):
         """Trim leading zero limbs; also report whether the result is zero.
@@ -1169,7 +1077,7 @@ class GPUBigInt:
             #     exactly that many drops the Newton step's extra leading zeros
             #     without a find_last_nonzero D2H read.
             #   * large x: _trim to the exact width.  Here a stray leading-zero
-            #     limb could push the next mul past an FFT transform-length power
+            #     limb could push the next mul past a transform-length power
             #     of two and double its cost, which outweighs the one sync.
             lo = prod[s_limbs:] if len(prod) > s_limbs \
                 else cp.array([0], dtype=cp.uint32)
@@ -1240,7 +1148,7 @@ class GPUBigInt:
         p = p_limbs * 32
 
         # Compute reciprocal x = floor(2^p / b).  Below the threshold, Python's
-        # big-int // is faster than launching ~25 GPU FFT muls; above it the
+        # big-int // is faster than launching ~25 GPU NTT muls; above it the
         # GPU Newton path wins by a wide margin.
         x = self._reciprocal(b, p)
 
