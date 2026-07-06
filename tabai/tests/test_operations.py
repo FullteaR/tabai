@@ -472,9 +472,11 @@ class TestIntInterop:
 #   _FFT_B8_BITS   — inside the B= 8 path  (n_fft_est ≥ 2^20)
 # ---------------------------------------------------------------------------
 
-# Just above the CPU-path threshold (2048 limbs = 65536 bits) so that
-# the FFT path is exercised while Python * can still verify correctness.
-_FFT_ENTRY_BITS = 70_000   # ~2188 limbs — smallest FFT-path size, B=16
+# Above the schoolbook/FFT dispatch threshold so the FFT path is genuinely
+# exercised.  Dispatch is on work = la*lb; a square power-of-2 product 1<<n *
+# 1<<m stores each operand as ~bits/2/32 limbs, so bits must exceed ~2*5120*32
+# (~327_680) for the pair's work to clear _MUL_SCHOOLBOOK_MAX_WORK = 5120*5120.
+_FFT_ENTRY_BITS = 350_000  # ~5469 limbs/operand — smallest FFT-path size, B=16
 _FFT_B16_BITS   = 500_000  # B=16 path, moderately sized FFT
 _FFT_B8_BITS    = 5_000_000  # B=8 path  (n_fft_est ≥ 2^20)
 
@@ -595,6 +597,48 @@ class TestMulFFTWorkspace:
         assert r2 == expected
 
 
+class TestMulFFTSquaring:
+    """Phase 3: the FFT squaring fast path (mul(a, a) with the same array object
+    skips the second operand's pad fill and forward transform, fa*=fa)."""
+
+    @pytest.mark.parametrize("bits", [
+        _FFT_ENTRY_BITS,   # B=16 FFT square (~10938 all-ones limbs)
+        _FFT_B16_BITS,
+        _FFT_B8_BITS,      # B=8 FFT square
+    ], ids=["entry", "b16", "b8"])
+    def test_square_all_ones(self, calc, bits):
+        a_int = (1 << bits) - 1
+        a = int_to_gpu(a_int)
+        assert gpu_to_int(calc.mul(a, a)) == a_int * a_int
+
+    def test_square_path_matches_general_path(self, calc):
+        """mul(a, a) (is_square True) must equal mul(a, a_copy) (general path)."""
+        random.seed(31337)
+        for bits in [_FFT_ENTRY_BITS, _FFT_B16_BITS]:
+            a_int = random.getrandbits(bits) | (1 << (bits - 1))
+            a = int_to_gpu(a_int)
+            a_copy = int_to_gpu(a_int)          # distinct object → general path
+            assert a is not a_copy
+            r_sq = gpu_to_int(calc.mul(a, a))    # a_gpu is b_gpu → square path
+            r_gen = gpu_to_int(calc.mul(a, a_copy))
+            assert r_sq == r_gen == a_int * a_int
+
+    def test_square_asymmetric_result_length(self, calc):
+        """Square of a value whose top limb is small (product shorter than 2*len)."""
+        a_int = (1 << (_FFT_ENTRY_BITS - 30)) + 7   # top bits sparse
+        a = int_to_gpu(a_int)
+        assert gpu_to_int(calc.mul(a, a)) == a_int * a_int
+
+    def test_tabaiint_pow2_uses_square_path(self):
+        """TabaiInt x*x and x**2 at FFT sizes are correct (pow's squarings feed
+        the same-object square path)."""
+        n = _FFT_B16_BITS
+        x = TabaiInt((1 << n) - 1)
+        expected = ((1 << n) - 1) ** 2
+        assert (x * x).to_cpu() == expected
+        assert (x ** 2).to_cpu() == expected
+
+
 # ---------------------------------------------------------------------------
 # Edge case tests for GPUBigInt operations
 # ---------------------------------------------------------------------------
@@ -681,27 +725,36 @@ class TestMulEdgeCases:
         assert gpu_to_int(calc.mul(int_to_gpu(a), int_to_gpu(b))) == a * b
 
     def test_mul_asymmetric_sizes(self, calc):
-        """One operand much larger than the other (both in CPU path)."""
+        """One operand much larger than the other (low work → schoolbook path)."""
         a = (1 << 10000) - 1
         b = 3
         assert gpu_to_int(calc.mul(int_to_gpu(a), int_to_gpu(b))) == a * b
 
-    def test_mul_asymmetric_sizes_fft(self, calc):
-        """One operand in FFT range, other is small — forces FFT path."""
-        a = (1 << 100000) - 1   # > 2048 limbs
-        b = 7
+    def test_mul_asymmetric_small_times_large_schoolbook(self, calc):
+        """Tiny x huge: work = 1*3125 << threshold, so schoolbook handles it
+        even though one operand dwarfs the square dispatch boundary."""
+        a = (1 << 100000) - 1   # ~3125 limbs
+        b = 7                    # 1 limb
         assert gpu_to_int(calc.mul(int_to_gpu(a), int_to_gpu(b))) == a * b
 
-    def test_mul_cpu_fft_threshold(self, calc):
-        """Values right at the CPU/FFT threshold boundary."""
-        # 2048 limbs = 65536 bits → CPU path
-        a_cpu = (1 << 65536) - 1
-        b_cpu = (1 << 65536) - 1
-        assert gpu_to_int(calc.mul(int_to_gpu(a_cpu), int_to_gpu(b_cpu))) == a_cpu * b_cpu
+    def test_mul_asymmetric_sizes_fft(self, calc):
+        """Unbalanced but high-work pair (9375 x 3125 limbs, work ~29M >
+        threshold) — forces the FFT path with asymmetric operand lengths."""
+        a = (1 << 300000) - 1   # ~9375 limbs
+        b = (1 << 100000) - 1   # ~3125 limbs
+        assert gpu_to_int(calc.mul(int_to_gpu(a), int_to_gpu(b))) == a * b
 
-        # 2049 limbs = 65568 bits → FFT path
-        a_fft = (1 << 65568) - 1
-        b_fft = (1 << 65568) - 1
+    def test_mul_schoolbook_fft_threshold(self, calc):
+        """Values straddling the schoolbook/FFT dispatch boundary (work=la*lb,
+        isqrt(threshold)=5120)."""
+        # 5120 limbs = 163840 bits, work = 5120^2 == threshold → schoolbook path
+        a_sb = (1 << 163840) - 1
+        b_sb = (1 << 163840) - 1
+        assert gpu_to_int(calc.mul(int_to_gpu(a_sb), int_to_gpu(b_sb))) == a_sb * b_sb
+
+        # 5121 limbs = 163872 bits, work = 5121^2 > threshold → FFT path
+        a_fft = (1 << 163872) - 1
+        b_fft = (1 << 163872) - 1
         assert gpu_to_int(calc.mul(int_to_gpu(a_fft), int_to_gpu(b_fft))) == a_fft * b_fft
 
     def test_mul_commutativity(self, calc):
@@ -893,7 +946,7 @@ class TestDivmodEdgeCases:
 
 
 class TestDivmodNewtonPath:
-    """divmod above _DIV_NEWTON_THRESHOLD_LIMBS (~64K bits) routes to the GPU
+    """divmod above _DIV_NEWTON_THRESHOLD_LIMBS (~164K bits) routes to the GPU
     Newton reciprocal.  These cases exercise that path against Python's exact
     divmod across a range of operand shapes that have historically trapped
     Newton-style algorithms."""
@@ -950,6 +1003,54 @@ class TestDivmodNewtonPath:
         q, r = calc.divmod(int_to_gpu(a), int_to_gpu(b))
         assert gpu_to_int(q) == k
         assert gpu_to_int(r) == 0
+
+
+class TestNewtonRampTrimGate:
+    """The Newton ramp normalises each step's width one of two ways depending on
+    _NEWTON_RAMP_TRIM_LIMBS: a deterministic sync-free top slice (small x) or a
+    _trim (large x).  Force each branch via the gate and require both to agree
+    with Python's exact divmod — including the power-of-two divisor edge, where
+    b_trunc is a bare power of two and the deterministic slice must keep the full
+    q_field//32 + 2 limbs (a tighter width would drop the top bit)."""
+
+    # gate=0 forces every ramp step through _trim; a huge gate forces every step
+    # through the deterministic slice.  Both must be exact.
+    @pytest.mark.parametrize("gate", [0, 10**9])
+    @pytest.mark.parametrize("a_bits,b_bits", [
+        (400_000, 200_000),   # generic Newton-size divmod
+        (400_000, 200_001),   # b_bits % 32 == 1  → q_field % 32 == 31 alignment
+    ], ids=lambda v: f"{v}")
+    def test_both_branches_match_python(self, calc, monkeypatch, gate, a_bits, b_bits):
+        monkeypatch.setattr("tabai_gpu.core._NEWTON_RAMP_TRIM_LIMBS", gate)
+        random.seed(a_bits * 31 + b_bits + gate)
+        a = _rand_bits(a_bits) | (1 << (a_bits - 1))
+        b = _rand_bits(b_bits) | (1 << (b_bits - 1))
+        q, r = calc.divmod(int_to_gpu(a), int_to_gpu(b))
+        assert gpu_to_int(q) == a // b
+        assert gpu_to_int(r) == a % b
+
+    @pytest.mark.parametrize("gate", [0, 10**9])
+    def test_power_of_two_divisor_both_branches(self, calc, monkeypatch, gate):
+        monkeypatch.setattr("tabai_gpu.core._NEWTON_RAMP_TRIM_LIMBS", gate)
+        a = _rand_bits(400_000) | (1 << 399_999)
+        b = 1 << 200_001          # power of two, b.bit_length() % 32 == 2
+        q, r = calc.divmod(int_to_gpu(a), int_to_gpu(b))
+        assert gpu_to_int(q) == a // b
+        assert gpu_to_int(r) == a % b
+
+    def test_gate_choice_does_not_change_result(self, calc, monkeypatch):
+        """The deterministic slice and _trim must produce identical quotients."""
+        random.seed(20260706)
+        a = _rand_bits(600_000) | (1 << 599_999)
+        b = _rand_bits(300_000) | (1 << 299_999)
+        ga = int_to_gpu(a)
+        gb = int_to_gpu(b)
+        monkeypatch.setattr("tabai_gpu.core._NEWTON_RAMP_TRIM_LIMBS", 0)
+        q_trim, r_trim = calc.divmod(ga, gb)
+        monkeypatch.setattr("tabai_gpu.core._NEWTON_RAMP_TRIM_LIMBS", 10**9)
+        q_det, r_det = calc.divmod(ga, gb)
+        assert gpu_to_int(q_trim) == gpu_to_int(q_det) == a // b
+        assert gpu_to_int(r_trim) == gpu_to_int(r_det) == a % b
 
 
 def _rand_bits(n: int) -> int:

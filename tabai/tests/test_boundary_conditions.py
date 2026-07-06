@@ -20,13 +20,17 @@ _U32 = 2**32
 _U64_MAX = 2**64 - 1
 _U64 = 2**64
 
-# CPU/FFT mul threshold  (core.py: _MUL_CPU_THRESHOLD_LIMBS = 2048)
-_MUL_CPU_BITS = 2048 * 32        # 65536 bits — last CPU-path size
-_MUL_FFT_BITS = 2049 * 32        # 65568 bits — first FFT-path size
+# Schoolbook/FFT mul dispatch threshold  (core.py: _MUL_SCHOOLBOOK_MAX_WORK = 5120*5120).
+# Dispatch is on work = la*lb limb-pairs; isqrt(threshold) == 5120, so a square
+# 5120-limb operand pair is the last schoolbook-path size and 5121 the first FFT.
+_MUL_SCHOOLBOOK_L = 5120          # isqrt(_MUL_SCHOOLBOOK_MAX_WORK)
+_MUL_SCHOOLBOOK_BITS = _MUL_SCHOOLBOOK_L * 32   # 163840 bits — last schoolbook size
+_MUL_FFT_L = 5121                 # first FFT-path size (square)
+_MUL_FFT_BITS = _MUL_FFT_L * 32   # 163872 bits
 
-# Newton reciprocal threshold for divmod  (core.py: _DIV_NEWTON_THRESHOLD_LIMBS = 12288)
-_NEWTON_LIMBS = 12288
-_NEWTON_BITS = _NEWTON_LIMBS * 32  # 393216 bits
+# Newton reciprocal threshold for divmod  (core.py: _DIV_NEWTON_THRESHOLD_LIMBS = 5120)
+_NEWTON_LIMBS = 5120
+_NEWTON_BITS = _NEWTON_LIMBS * 32  # 163840 bits
 
 # Pow sliding-window k thresholds (based on exponent bit_length)
 #   k=1 for bit_length <= 8,  k=2 for <= 24,  k=3 for <= 70, ...
@@ -140,31 +144,58 @@ class TestMulLimbBoundary:
 
 
 # =========================================================================
-# 4. Mul at CPU / FFT path threshold (2048 limbs)
+# 4. Mul at schoolbook / FFT dispatch threshold (work = la*lb, isqrt = 5120)
 # =========================================================================
 
-class TestMulCpuFftThreshold:
+class TestMulSchoolbookFftThreshold:
 
-    def test_mul_at_cpu_threshold(self):
-        a = (1 << _MUL_CPU_BITS) - 1
-        b = (1 << _MUL_CPU_BITS) - 1
+    def test_mul_at_schoolbook_threshold(self):
+        # work = 5120*5120 == threshold → schoolbook path (last eligible size).
+        a = (1 << _MUL_SCHOOLBOOK_BITS) - 1
+        b = (1 << _MUL_SCHOOLBOOK_BITS) - 1
         assert (TabaiInt(a) * TabaiInt(b)).to_cpu() == a * b
 
-    def test_mul_just_above_cpu_threshold(self):
+    def test_mul_just_above_schoolbook_threshold(self):
+        # work = 5121*5121 > threshold → FFT path.
         a = (1 << _MUL_FFT_BITS) - 1
         b = (1 << _MUL_FFT_BITS) - 1
         assert (TabaiInt(a) * TabaiInt(b)).to_cpu() == a * b
 
-    def test_mul_mixed_cpu_fft_operand(self):
-        a = (1 << _MUL_CPU_BITS) - 1    # 2048 limbs → CPU eligible
-        b = (1 << _MUL_FFT_BITS) - 1    # 2049 limbs → forces FFT
+    def test_mul_mixed_operand_crosses_threshold(self):
+        # 5120 x 5121 limbs: work = 5120*5121 > threshold → FFT path.
+        a = (1 << _MUL_SCHOOLBOOK_BITS) - 1
+        b = (1 << _MUL_FFT_BITS) - 1
         assert (TabaiInt(a) * TabaiInt(b)).to_cpu() == a * b
 
-    def test_mul_identity_at_cpu_threshold(self):
-        n = _MUL_CPU_BITS // 2
+    def test_mul_asymmetric_low_work_stays_schoolbook(self):
+        # Very unbalanced but work = 1*8192 << threshold → schoolbook, even
+        # though one operand alone is far larger than the square boundary.
+        a = (1 << 32) - 1                       # 1 limb
+        b = (1 << (8192 * 32)) - 1              # 8192 limbs
+        assert (TabaiInt(a) * TabaiInt(b)).to_cpu() == a * b
+
+    def test_mul_identity_at_schoolbook_threshold(self):
+        n = _MUL_SCHOOLBOOK_BITS // 2
         a = (1 << n) + 1
         b = (1 << n) - 1
         assert (TabaiInt(a) * TabaiInt(b)).to_cpu() == (1 << (2 * n)) - 1
+
+    def test_mul_all_ones_stress(self):
+        # All-0xFFFFFFFF limbs maximise every column sum (worst carry chains).
+        for nlimbs in [2048, 5120, 5121]:
+            a = (1 << (nlimbs * 32)) - 1
+            assert (TabaiInt(a) * TabaiInt(a)).to_cpu() == a * a
+
+    @pytest.mark.parametrize("la,lb", [
+        (1, 1), (2, 2), (31, 31), (32, 32), (33, 33),
+        (1, 33), (2, 2048), (2047, 2047), (2048, 2048), (2049, 2049),
+        (33, 5120), (5120, 5121),
+    ])
+    def test_mul_random_limb_counts(self, la, lb):
+        rng = random.Random(1000 * la + lb)
+        a = rng.getrandbits(la * 32) | (1 << (la * 32 - 1))
+        b = rng.getrandbits(lb * 32) | (1 << (lb * 32 - 1))
+        assert (TabaiInt(a) * TabaiInt(b)).to_cpu() == a * b
 
 
 # =========================================================================
@@ -488,3 +519,110 @@ class TestFloordivModConsistency:
             TabaiInt(_U32_MAX) % TabaiInt(0)
         with pytest.raises(ZeroDivisionError):
             divmod(TabaiInt(_U32_MAX), TabaiInt(0))
+
+
+# =========================================================================
+# 13. Phase 1 — neg/abs alias safety (share the magnitude buffer, no copy)
+# =========================================================================
+
+class TestNegAbsAliasSafety:
+    """__neg__/__abs__ alias the underlying GPU buffer instead of copying.
+    Because magnitude arrays are immutable after construction, deriving new
+    values from the alias must never mutate the original."""
+
+    def test_neg_alias_does_not_mutate_original(self):
+        x = TabaiInt(_U64_MAX)
+        y = -x
+        z = y + 1                       # derive a new value from the alias
+        assert x.to_cpu() == _U64_MAX   # original intact
+        assert y.to_cpu() == -_U64_MAX
+        assert z.to_cpu() == -_U64_MAX + 1
+
+    def test_abs_alias_does_not_mutate_original(self):
+        x = TabaiInt(-((1 << 200) + 1))
+        w = abs(x)
+        _ = w + 12345                   # derive from the alias
+        assert x.to_cpu() == -((1 << 200) + 1)
+        assert w.to_cpu() == (1 << 200) + 1
+
+    @pytest.mark.parametrize("val", [_U32_MAX, -_U64, (1 << 200) + 7, -((1 << 200) + 7)])
+    def test_double_neg_roundtrip_preserves_original(self, val):
+        x = TabaiInt(val)
+        assert (-(-x)).to_cpu() == val
+        assert x.to_cpu() == val        # original still intact after aliasing
+
+    def test_neg_then_mul_preserves_operand(self):
+        x = TabaiInt(_U32_MAX)
+        y = -x
+        p = y * y                       # uses y._gpu (aliased) as both operands
+        assert p.to_cpu() == _U32_MAX ** 2
+        assert x.to_cpu() == _U32_MAX
+        assert y.to_cpu() == -_U32_MAX
+
+
+# =========================================================================
+# 14. Phase 1 — length/sign-aware magnitude comparison short-circuit
+# =========================================================================
+
+class TestMagCmpLengthShortcut:
+
+    @pytest.mark.parametrize("a,b", [
+        (_U32, _U32_MAX),          # 2 limbs vs 1 limb
+        (_U64, _U32_MAX),          # 3 vs 1
+        ((1 << 200), _U64_MAX),    # 7 vs 2
+        (_U32_MAX, _U32),          # 1 vs 2 (reversed)
+    ])
+    def test_len_mismatch_positive(self, a, b):
+        assert (TabaiInt(a) > TabaiInt(b)) == (a > b)
+        assert (TabaiInt(a) < TabaiInt(b)) == (a < b)
+        assert (TabaiInt(a) == TabaiInt(b)) == (a == b)
+
+    @pytest.mark.parametrize("a,b", [
+        (-_U32, -_U32_MAX),
+        (-_U64, -_U32),
+        (_U32, -_U64),
+        (-(1 << 200), 1 << 64),
+    ])
+    def test_len_mismatch_signed(self, a, b):
+        assert (TabaiInt(a) < TabaiInt(b)) == (a < b)
+        assert (TabaiInt(a) > TabaiInt(b)) == (a > b)
+
+    @pytest.mark.parametrize("val", [_U32_MAX, _U64, (1 << 200) + 123])
+    def test_equal_same_length(self, val):
+        assert TabaiInt(val) == TabaiInt(val)
+        assert not (TabaiInt(val) < TabaiInt(val))
+        assert TabaiInt(val) <= TabaiInt(val)
+
+    def test_addsub_pick_larger_magnitude_across_lengths(self):
+        # exercises _mag_cmp inside __add__/__sub__ with differing limb counts
+        assert (TabaiInt(-_U32) + TabaiInt(_U64)).to_cpu() == (-_U32) + _U64
+        assert (TabaiInt(_U32) - TabaiInt(_U64_MAX)).to_cpu() == _U32 - _U64_MAX
+        assert (TabaiInt(_U64) + TabaiInt(-_U32_MAX)).to_cpu() == _U64 - _U32_MAX
+
+
+# =========================================================================
+# 15. Phase 1 — cached zero-flag consistency across paths
+# =========================================================================
+
+class TestZeroFlagConsistency:
+
+    @pytest.mark.parametrize("val", [_U32_MAX, _U64, (1 << 300) - 1])
+    def test_subtraction_to_zero_stays_zero(self, val):
+        r = TabaiInt(val) - TabaiInt(val)
+        assert r.to_cpu() == 0 and r._sign == 1
+        assert (r * TabaiInt(999)).to_cpu() == 0        # zero * x == 0
+
+    def test_mul_by_zero_both_orders(self):
+        z = TabaiInt(0)
+        big = TabaiInt((1 << 500) + 1)
+        assert (z * big).to_cpu() == 0
+        assert (big * z).to_cpu() == 0
+
+    def test_divmod_exact_and_dividend_smaller(self):
+        a = TabaiInt((1 << 128) - 1)
+        q, r = divmod(a, a)                              # exact -> r == 0
+        assert q.to_cpu() == 1 and r.to_cpu() == 0 and r._sign == 1
+        q2, r2 = divmod(TabaiInt(5), TabaiInt(_U64))     # a < b -> q == 0
+        assert q2.to_cpu() == 0 and r2.to_cpu() == 5
+        # q2 is zero: multiplying by it must still yield zero
+        assert (q2 * TabaiInt(_U32_MAX)).to_cpu() == 0

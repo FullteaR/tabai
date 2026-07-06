@@ -16,5 +16,7 @@ def int_to_gpu(n: int) -> cp.ndarray:
 
 
 def gpu_to_int(gpu_arr: cp.ndarray) -> int:
-    cpu_arr = cp.asnumpy(gpu_arr).astype(np.uint32)
+    # gpu_arr is always a uint32 little-endian limb array, so asnumpy already
+    # yields uint32 — the extra .astype(np.uint32) copy was redundant.
+    cpu_arr = cp.asnumpy(gpu_arr)
     return int.from_bytes(cpu_arr.tobytes(), byteorder='little')
