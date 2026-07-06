@@ -5,18 +5,37 @@ _BLOCK = 256
 
 _ONE = cp.array([1], dtype=cp.uint32)
 
-# For mul operands whose combined size is at most this many limbs, delegate to
-# Python's built-in int * (Karatsuba) instead of launching cuFFT.  The cuFFT
-# pipeline costs ~1 ms regardless of input size (kernel-launch + plan overhead),
-# while Python int * for 64 K-bit operands is ~900 µs and for 1 K-bit is ~2 µs.
-# The crossover (FFT faster than Python) is around 80 K bits per operand.
-_MUL_CPU_THRESHOLD_LIMBS = 2048  # 65536 bits per operand
+# Mul dispatch (Phase 2).  For operands whose per-column work la*lb is at most
+# this many limb-pairs, an all-GPU schoolbook kernel (base-2^16 column sums fed
+# into the shared carry-resolution pipeline) beats cuFFT: it has no cudaMalloc /
+# FFT-plan overhead and, crucially, no GPU->CPU->GPU roundtrip like the old
+# Python-int * path.  Above the threshold the O(n^2) column work loses to the
+# FFT's O(n log n) and we switch to _mul_fft.
+#
+# Tuned by sweep on an RTX 3090: for balanced (square) operands — the worst case
+# for schoolbook at a fixed la*lb, since they maximise the longest column loop —
+# the crossover is L ~= 5120 limbs (work ~= 26M).  Below it schoolbook wins
+# decisively (~2x at L=4096); asymmetric operands of equal work win by more, so
+# la*lb is a conservative routing metric.  isqrt(threshold) == 5120 exactly.
+_MUL_SCHOOLBOOK_MAX_WORK = 5120 * 5120  # la*lb limb-pairs (26_214_400)
 
 # divmod's reciprocal step. Below this size, computing floor(2^p / b) with
 # Python's int // is faster than running ~log2(p/53) GPU FFT mul iterations.
 # Above it, the CPU step dominates the whole divmod and the GPU Newton path wins.
-# The threshold sits at the empirical crossover (~380 Kbit) for a/b with b≈a/2.
-_DIV_NEWTON_THRESHOLD_LIMBS = 12288  # ~393 Kbits
+# The threshold sits at the empirical crossover (~164 Kbit) for a/b with b≈a/2.
+# It dropped from 12288 after the faster mul (schoolbook + squaring) and the
+# leaner Newton ramp made the GPU path win from ~5120 limbs up (a swept crossover
+# where cpu// and Newton tie; Newton wins outright by 5632).
+_DIV_NEWTON_THRESHOLD_LIMBS = 5120  # ~164 Kbits
+
+# In the Newton ramp, each step's approximation carries a couple of leading zero
+# limbs on top.  Below this working width we drop them with a *deterministic*
+# top-slice (no host sync): a stray zero limb makes the next small mul only
+# marginally wider, and skipping ~log2(p/64) find_last_nonzero D2H syncs is the
+# larger saving.  At or above it we _trim instead — there the extra limb can
+# push the (now large) next mul past an FFT transform-length boundary and double
+# its cost, which dwarfs the single sync the trim spends.  Swept crossover.
+_NEWTON_RAMP_TRIM_LIMBS = 40000
 
 _compute_states_kernel = cp.RawKernel(r'''
 extern "C" __global__
@@ -274,6 +293,43 @@ void apply_mul_carries(
 }
 ''', 'apply_mul_carries')
 
+# ---------------------------------------------------------------------------
+# Phase 2: all-GPU schoolbook multiply producing base-2^16 column sums.
+#
+# One thread = one output column c.  Each uint32 limb is split into two 16-bit
+# half-words (little-endian), and column c accumulates  sum_{i+j=c} a16[i]*b16[j].
+# Every partial product aw*bw < 2^32; a column has at most min(2*na, 2*nb) terms,
+# so the int64 accumulator is safe (min_chunks << 2^31 for any operand we route
+# here — capped by _MUL_SCHOOLBOOK_MAX_WORK).  The int64 column sums feed the
+# same carry-resolution pipeline (carry_prop_step / extract / scan / apply) as
+# the FFT path, so no GPU->CPU roundtrip ever occurs.
+# ---------------------------------------------------------------------------
+_schoolbook_mul16_kernel = cp.RawKernel(r'''
+extern "C" __global__
+void schoolbook_mul16(
+    const unsigned int* __restrict__ a, int na,
+    const unsigned int* __restrict__ b, int nb,
+    long long* __restrict__ out, int n_cols)
+{
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= n_cols) return;
+    int na16 = 2 * na;
+    int nb16 = 2 * nb;
+    int i_lo = col - (nb16 - 1);
+    if (i_lo < 0) i_lo = 0;
+    int i_hi = col;
+    if (i_hi > na16 - 1) i_hi = na16 - 1;
+    long long acc = 0;
+    for (int i = i_lo; i <= i_hi; ++i) {
+        int j = col - i;
+        unsigned int aw = (a[i >> 1] >> ((i & 1) * 16)) & 0xFFFFu;
+        unsigned int bw = (b[j >> 1] >> ((j & 1) * 16)) & 0xFFFFu;
+        acc += (long long)(aw * bw);
+    }
+    out[col] = acc;
+}
+''', 'schoolbook_mul16')
+
 _addsub_small_kernel = cp.RawKernel(r'''
 extern "C" __global__
 void addsub_small(
@@ -388,21 +444,30 @@ class GPUBigInt:
             self._scan_bufs.append(cp.empty(blocks, dtype=cp.int32))
             size = blocks
 
+    def _ensure_carry_capacity(self, carry_n: int) -> None:
+        """Grow the int64 carry ping-pong buffers to hold carry_n chunk sums.
+
+        Shared by both the FFT and the schoolbook mul paths (Phase 2 split them
+        from the float64 FFT pads so the schoolbook path never allocates the
+        pads it does not use).  Amortised: grows but never shrinks.
+        """
+        if carry_n <= len(self._fft_carry_ping):
+            return
+        self._fft_carry_ping = cp.empty(carry_n, dtype=cp.int64)
+        self._fft_carry_pong = cp.empty(carry_n, dtype=cp.int64)
+
     def _ensure_fft_capacity(self, n_fft: int) -> None:
         """Grow pre-allocated FFT workspace buffers to handle transforms of size n_fft.
 
-        Allocates:
-          - Two float64 buffers of length n_fft  (FFT input pads for a and b).
-          - Two int64 carry ping-pong buffers of length n_fft + 1  (one carry-out
-            slot beyond the n_fft convolution coefficients).
+        Allocates two float64 buffers of length n_fft (FFT input pads for a and
+        b) and, via _ensure_carry_capacity, the int64 carry ping-pong buffers of
+        length n_fft + 1 (one carry-out slot beyond the n_fft coefficients).
         Reallocation is amortised: buffers grow but never shrink.
         """
-        if n_fft <= len(self._fft_buf_a):
-            return
-        self._fft_buf_a = cp.empty(n_fft, dtype=cp.float64)
-        self._fft_buf_b = cp.empty(n_fft, dtype=cp.float64)
-        self._fft_carry_ping = cp.empty(n_fft + 1, dtype=cp.int64)
-        self._fft_carry_pong = cp.empty(n_fft + 1, dtype=cp.int64)
+        if n_fft > len(self._fft_buf_a):
+            self._fft_buf_a = cp.empty(n_fft, dtype=cp.float64)
+            self._fft_buf_b = cp.empty(n_fft, dtype=cp.float64)
+        self._ensure_carry_capacity(n_fft + 1)
 
     def _scan(self, states, n, _level=0):
         blocks = (n + _BLOCK - 1) // _BLOCK
@@ -455,17 +520,123 @@ class GPUBigInt:
     def sub(self, a_gpu, b_gpu):
         return self._addsub(a_gpu, b_gpu, True)
 
-    def mul(self, a_gpu, b_gpu):
-        # ------------------------------------------------------------------ #
-        # Fast path: small operands — Python int * beats cuFFT for < 64 K bits
-        # ------------------------------------------------------------------ #
-        if len(a_gpu) <= _MUL_CPU_THRESHOLD_LIMBS and len(b_gpu) <= _MUL_CPU_THRESHOLD_LIMBS:
-            a_np = cp.asnumpy(a_gpu).astype(np.uint32)
-            b_np = cp.asnumpy(b_gpu).astype(np.uint32)
-            a_int = int.from_bytes(a_np.tobytes(), 'little')
-            b_int = int.from_bytes(b_np.tobytes(), 'little')
-            return self._from_int(a_int * b_int)
+    def _addsub_trimmed(self, a_gpu, b_gpu, is_sub):
+        """add/sub returning (trimmed_result, is_zero) for the TabaiInt layer.
 
+        On the fused single-block path the trim index is already sitting in
+        _trim_idx_buf (addsub_small writes it), so we consume it directly and
+        skip a second find_last_nonzero launch plus the constructor's re-trim.
+        The raw add/sub above stay sync-free and are used internally (Newton).
+        """
+        result = self._addsub(a_gpu, b_gpu, is_sub)
+        n = max(len(a_gpu), len(b_gpu))
+        if n <= _BLOCK:
+            last = int(self._trim_idx_buf[0])  # trim index from addsub_small
+            if last < 0:
+                return cp.array([0], dtype=cp.uint32), True
+            return result[:last + 1], False
+        return self._trim_z(result)
+
+    def add_trimmed(self, a_gpu, b_gpu):
+        return self._addsub_trimmed(a_gpu, b_gpu, False)
+
+    def sub_trimmed(self, a_gpu, b_gpu):
+        return self._addsub_trimmed(a_gpu, b_gpu, True)
+
+    def mul(self, a_gpu, b_gpu):
+        # Dispatch (Phase 2).  For small per-column work an all-GPU schoolbook
+        # kernel avoids the FFT's plan/malloc overhead and any host roundtrip;
+        # above the threshold the O(n log n) FFT wins over O(n^2) columns.
+        la, lb = len(a_gpu), len(b_gpu)
+        if la * lb <= _MUL_SCHOOLBOOK_MAX_WORK:
+            return self._mul_schoolbook(a_gpu, b_gpu)
+        # Phase 3: squaring (same array object for both operands, as produced by
+        # __pow__'s repeated squarings) lets the FFT path skip the second operand
+        # fill and its forward transform — one rfft instead of two.
+        return self._mul_fft(a_gpu, b_gpu, is_square=a_gpu is b_gpu)
+
+    def _resolve_carries(self, carry_n, chunk_bits, max_bits):
+        """Resolve base-2^chunk_bits column sums into final chunk values.
+
+        The caller must have already written the (arbitrary-magnitude) int64
+        column sums into self._fft_carry_ping[:carry_n], including a zeroed
+        carry-out slot at the top.  Returns the buffer (ping or pong, depending
+        on iteration parity) whose first carry_n int64 elements each hold a
+        value < 2^chunk_bits.  Zero GPU->CPU syncs.
+
+        max_bits is an upper bound on the bit length of the largest input column
+        sum; it fixes the number of carry_prop_step iterations.  Over-estimating
+        is harmless (once every element is < 2^chunk_bits the step is a no-op).
+        """
+        ping = self._fft_carry_ping[:carry_n]
+        pong = self._fft_carry_pong[:carry_n]
+        blocks_carry = (carry_n + _BLOCK - 1) // _BLOCK
+
+        # Step 1: fixed-count carry reduction (no sync).
+        k = -(-max_bits // chunk_bits)
+        for _ in range(k):
+            _carry_prop_step_kernel(
+                (blocks_carry,), (_BLOCK,),
+                (ping, pong, carry_n, chunk_bits))
+            ping, pong = pong, ping
+
+        # Step 2: extract 3-state encoding and parallel prefix-scan (no sync).
+        self._ensure_capacity(carry_n)
+        states = self._states_buf[:carry_n]
+        _extract_mul_states_kernel(
+            (blocks_carry,), (_BLOCK,),
+            (ping, states, carry_n, chunk_bits))
+        self._scan(states, carry_n)
+
+        # Step 3: apply resolved carries (no sync).
+        _apply_mul_carries_kernel(
+            (blocks_carry,), (_BLOCK,),
+            (ping, states, carry_n, chunk_bits))
+        return ping
+
+    def _recombine_chunks(self, ping, carry_n, chunk_bits, max_limbs):
+        """Pack carry_n resolved base-2^chunk_bits chunks (int64, each
+        < 2^chunk_bits) into uint32 limbs, conservatively trimmed to max_limbs.
+
+        Writes into one padded buffer (no cp.concatenate whole-array copy):
+        cast the chunks in, zeroing only the <= chunks_per_limb-1 pad tail.
+        No GPU->CPU sync.
+        """
+        out_dtype = cp.uint16 if chunk_bits == 16 else cp.uint8
+        chunks_per_limb = 32 // chunk_bits  # 2 for uint16, 4 for uint8
+        n_padded = ((carry_n + chunks_per_limb - 1) // chunks_per_limb) * chunks_per_limb
+        out = cp.empty(n_padded, dtype=out_dtype)
+        if n_padded > carry_n:
+            out[carry_n:] = 0
+        out[:carry_n] = ping   # cast int64 -> uint16/uint8 on assignment
+        limbs = out.view(cp.uint32)
+        return limbs[:max_limbs] if len(limbs) > max_limbs else limbs
+
+    def _mul_schoolbook(self, a_gpu, b_gpu):
+        # base-2^16 column sums straight into the carry buffer, then the shared
+        # carry-resolution pipeline.  No FFT, no host roundtrip.
+        chunk_bits = 16
+        la, lb = len(a_gpu), len(b_gpu)
+        na16, nb16 = 2 * la, 2 * lb
+        n_cols = na16 + nb16 - 1
+        carry_n = n_cols + 1
+        self._ensure_carry_capacity(carry_n)
+        ping = self._fft_carry_ping[:carry_n]
+
+        blocks = (n_cols + _BLOCK - 1) // _BLOCK
+        _schoolbook_mul16_kernel(
+            (blocks,), (_BLOCK,),
+            (a_gpu, la, b_gpu, lb, ping, n_cols))
+        ping[n_cols] = 0  # carry-out slot
+
+        # Each column sum <= min(na16, nb16) * (2^16-1)^2 < 2^(2*16) * min(...);
+        # its bit length is bounded by 2*chunk_bits + bit_length(min terms).
+        n_terms = min(na16, nb16)
+        max_bits = 2 * chunk_bits + n_terms.bit_length()
+        ping = self._resolve_carries(carry_n, chunk_bits, max_bits)
+        return self._recombine_chunks(ping, carry_n, chunk_bits, la + lb)
+
+    def _mul_fft(self, a_gpu, b_gpu, is_square=False):
         # ------------------------------------------------------------------ #
         # Adaptive chunk width to maintain float64 precision.
         #
@@ -505,88 +676,66 @@ class GPUBigInt:
         while n_fft < n_conv:
             n_fft <<= 1
 
-        # Phase 4: ensure pre-allocated workspace is large enough (no malloc per call).
+        # ensure pre-allocated workspace is large enough (no malloc per call).
         self._ensure_fft_capacity(n_fft)
 
-        # Phase 4: reuse pre-allocated float64 pads — clear only the padding region.
+        # reuse pre-allocated float64 pads — clear only the padding region.
         a_f = self._fft_buf_a[:n_fft]
-        b_f = self._fft_buf_b[:n_fft]
-        a_f[:n_a] = a_chunks.astype(cp.float64)
+        # Cast on assignment (uint16/uint8 view -> float64 slice) — avoids an
+        # extra full-size .astype() temporary per operand.
+        a_f[:n_a] = a_chunks
         a_f[n_a:] = 0
-        b_f[:n_b] = b_chunks.astype(cp.float64)
-        b_f[n_b:] = 0
 
         fa = cp.fft.rfft(a_f)
-        fb = cp.fft.rfft(b_f)
-        fa *= fb
+        if is_square:
+            # Phase 3: squaring — the second operand is identical, so its pad
+            # fill and forward transform are redundant.  fa*fa is the transform
+            # of the self-convolution.
+            fa *= fa
+        else:
+            b_f = self._fft_buf_b[:n_fft]
+            b_f[:n_b] = b_chunks
+            b_f[n_b:] = 0
+            fb = cp.fft.rfft(b_f)
+            fa *= fb
         c = cp.fft.irfft(fa, n=n_fft)
 
-        # ------------------------------------------------------------------ #
-        # Carry propagation — zero GPU→CPU syncs.
-        #
-        # Step 1: Fixed-count carry_prop_step iterations reduce every
-        #   element from up to ~(log2(n_fft) + 2B) bits down to at most
-        #   2^chunk_bits.  At that point each position's carry is 0 or 1.
-        #
-        # Step 2: Extract 3-state encoding (kill/propagate/generate) and
-        #   resolve carry chains with the same parallel prefix scan used
-        #   for add/sub.  O(log n) work, no GPU→CPU sync.
-        #
-        # Step 3: Apply resolved carries to produce final chunk values.
-        # ------------------------------------------------------------------ #
+        # Carry propagation — zero GPU→CPU syncs (shared pipeline).
         carry_n = n_fft + 1
         ping = self._fft_carry_ping[:carry_n]
-        pong = self._fft_carry_pong[:carry_n]
-        ping[:n_fft] = cp.rint(c).astype(cp.int64)
+        cp.rint(c, out=c)      # round in place (c is our own irfft output)
+        ping[:n_fft] = c       # cast float64 -> int64 on assignment (values exact)
         ping[n_fft] = 0  # carry-out slot
 
-        # Step 1: fixed-count carry reduction (no sync).
-        k = -(-((n_fft.bit_length() - 1) + 2 * chunk_bits) // chunk_bits)
-        blocks_carry = (carry_n + _BLOCK - 1) // _BLOCK
-        for _ in range(k):
-            _carry_prop_step_kernel(
-                (blocks_carry,), (_BLOCK,),
-                (ping, pong, carry_n, chunk_bits))
-            ping, pong = pong, ping
+        max_bits = (n_fft.bit_length() - 1) + 2 * chunk_bits
+        ping = self._resolve_carries(carry_n, chunk_bits, max_bits)
+        # Conservative trim: product needs at most len(a) + len(b) limbs.
+        return self._recombine_chunks(ping, carry_n, chunk_bits,
+                                      len(a_gpu) + len(b_gpu))
 
-        # Step 2: extract states and prefix-scan (no sync).
-        self._ensure_capacity(carry_n)
-        states = self._states_buf[:carry_n]
-        _extract_mul_states_kernel(
-            (blocks_carry,), (_BLOCK,),
-            (ping, states, carry_n, chunk_bits))
-        self._scan(states, carry_n)
+    def _trim_z(self, gpu_arr):
+        """Trim leading zero limbs; also report whether the result is zero.
 
-        # Step 3: apply resolved carries (no sync).
-        _apply_mul_carries_kernel(
-            (blocks_carry,), (_BLOCK,),
-            (ping, states, carry_n, chunk_bits))
-
-        # Recombine: view small-int array as uint32 limbs.
-        out_dtype = cp.uint16 if chunk_bits == 16 else cp.uint8
-        chunks_per_limb = 32 // chunk_bits  # 2 for uint16, 4 for uint8
-        out = ping.astype(out_dtype)
-        pad = (-len(out)) % chunks_per_limb
-        if pad:
-            out = cp.concatenate([out, cp.zeros(pad, dtype=out_dtype)])
-        # Conservative trim: product of two numbers needs at most
-        # len(a) + len(b) limbs.  Slice without any GPU→CPU sync.
-        limbs = out.view(cp.uint32)
-        max_limbs = len(a_gpu) + len(b_gpu)
-        return limbs[:max_limbs] if len(limbs) > max_limbs else limbs
-
-    def _trim(self, gpu_arr):
+        The zero flag comes for free: it is exactly (last < 0) from the
+        reduction the trim already performs.  Callers that need to know
+        zero-ness (e.g. the TabaiInt layer's sign normalisation) thus avoid a
+        second GPU→CPU sync.  Returns (trimmed_array, is_zero).
+        """
         n = len(gpu_arr)
         if n == 0:
-            return cp.array([0], dtype=cp.uint32)
+            return cp.array([0], dtype=cp.uint32), True
         # Reset pre-allocated buffer (async, serialized on the null stream)
         self._trim_idx_buf.fill(-1)
         blocks = (n + _BLOCK - 1) // _BLOCK
         _find_last_nonzero_kernel((blocks,), (_BLOCK,), (gpu_arr, n, self._trim_idx_buf))
         last = int(self._trim_idx_buf[0])  # GPU→CPU sync
         if last < 0:
-            return cp.array([0], dtype=cp.uint32)
-        return gpu_arr[:last + 1]
+            return cp.array([0], dtype=cp.uint32), True
+        return gpu_arr[:last + 1], False
+
+    def _trim(self, gpu_arr):
+        arr, _ = self._trim_z(gpu_arr)
+        return arr
 
     def _compare(self, a_gpu, b_gpu):
         n = max(len(a_gpu), len(b_gpu))
@@ -643,15 +792,16 @@ class GPUBigInt:
         arr_np = np.frombuffer(b, dtype=np.uint32)
         return cp.asarray(arr_np)
 
-    def _reciprocal(self, b_gpu, p):
+    def _reciprocal(self, b, p):
         """Return floor(2^p / b) as a uint32 GPU array.
 
         Dispatches to the GPU Newton path for large p, otherwise computes the
         reciprocal on the CPU with Python big-int division.  Caller must
-        guarantee b > 0 and p % 32 == 0.
+        guarantee b > 0, b already trimmed (top limb non-zero), and p % 32 == 0.
         """
-        b = self._trim(b_gpu)
-        n_b = self._bit_length(b)
+        # b is trimmed and non-zero, so its bit length needs no re-trim — just
+        # the top limb's bit_length (one unavoidable read).
+        n_b = (len(b) - 1) * 32 + int(b[-1]).bit_length()
         if p < n_b:
             return cp.array([0], dtype=cp.uint32)
 
@@ -747,32 +897,57 @@ class GPUBigInt:
             two[s_limbs] = 2
             diff = self.sub(two, bx)
             prod = self.mul(x, diff)
-            x = self._trim(prod[s_limbs:]) if len(prod) > s_limbs \
+            # >> s is a free low-limb slice.  Then normalise x's width, size-gated:
+            #   * small x: deterministic top slice, no host sync.  b_trunc keeps
+            #     b's top bit, so x = floor(2^s / b_trunc) <= 2^(q_field+1); its
+            #     bit length is at most q_field+2 (equality only for a power-of-two
+            #     b_trunc), i.e. it always fits in q_field//32 + 2 limbs.  Keeping
+            #     exactly that many drops the Newton step's extra leading zeros
+            #     without a find_last_nonzero D2H read.
+            #   * large x: _trim to the exact width.  Here a stray leading-zero
+            #     limb could push the next mul past an FFT transform-length power
+            #     of two and double its cost, which outweighs the one sync.
+            lo = prod[s_limbs:] if len(prod) > s_limbs \
                 else cp.array([0], dtype=cp.uint32)
+            if len(lo) <= _NEWTON_RAMP_TRIM_LIMBS:
+                x = lo[:q_field // 32 + 2]
+            else:
+                x = self._trim(lo)
 
             ex = ex_next
 
-        # ---- Step 3: full-scale fixed-point finish (exact, from below) ------
+        # ---- Step 3: single full-b Newton finish (exact, from below) --------
+        # The ramp uses a low-limb-truncated b, so x may still be a hair off the
+        # true 2^p/b.  A single full-precision Newton step is provably enough:
+        #   * the ramp always reaches >= half the target precision (it doubles q
+        #     each step until ex==p), so the relative error e satisfies
+        #     e <= 2^-(q/2), and one step maps e -> e^2 < 2^-q, i.e. within 1 ULP;
+        #   * the map x -> x*(2^(p+1)-b*x)/2^p converges monotonically from below
+        #     (from x=r(1+-f) it lands at r(1-f^2) <= r), so x <= floor(2^p/b)
+        #     afterwards, leaving only a small upward correction for step 4.
+        # A fixed single iteration therefore removes both the old confirmation
+        # iteration and its per-iteration compare (a D2H sync) — measured
+        # finish_iters was 1-2 with the loop, so 1 useful step always sufficed.
         two_p_plus_1 = cp.zeros(p_limbs + 1, dtype=cp.uint32)
         two_p_plus_1[p_limbs] = 2
-        for _ in range(6):
-            bx = self.mul(b, x)
-            diff = self.sub(two_p_plus_1, bx)
-            prod = self.mul(x, diff)
-            x_new = self._trim(prod[p_limbs:]) if len(prod) > p_limbs \
-                else cp.array([0], dtype=cp.uint32)
-            if self._compare(x_new, x) == 0:
-                break
-            x = x_new
+        bx = self.mul(b, x)
+        diff = self.sub(two_p_plus_1, bx)
+        prod = self.mul(x, diff)
+        x = prod[p_limbs:] if len(prod) > p_limbs \
+            else cp.array([0], dtype=cp.uint32)
 
-        # ---- Step 4: defensive +1 adjustment (uses original b) --------------
+        # ---- Step 4: +1 adjustment to the exact floor ----------------------
+        # x <= floor(2^p/b) from the finish, within a couple of ULPs.  Increment
+        # while (x+1)*b <= 2^p.  b*(x+1) = b*x + b, so after one initial mul we
+        # extend by a cheap add per step instead of a full-precision multiply.
         two_p = cp.zeros(p_limbs + 1, dtype=cp.uint32)
         two_p[p_limbs] = 1
+        bx = self.mul(b, x)
         for _ in range(4):
-            x_plus = self.add(x, _ONE)
-            bx_plus = self.mul(b, x_plus)
-            if self._compare(bx_plus, two_p) <= 0:
-                x = x_plus
+            bx_next = self.add(bx, b)
+            if self._compare(bx_next, two_p) <= 0:
+                x = self.add(x, _ONE)
+                bx = bx_next
             else:
                 break
         return x
@@ -784,11 +959,15 @@ class GPUBigInt:
             raise ZeroDivisionError("division by zero")
         cmp = self._compare(a, b)
         if cmp < 0:
-            return cp.array([0], dtype=cp.uint32), a.copy()
+            # a is already trimmed and immutable, so it is the remainder as-is
+            # (no defensive copy needed — no kernel ever writes to an operand).
+            return cp.array([0], dtype=cp.uint32), a
         if cmp == 0:
             return cp.array([1], dtype=cp.uint32), cp.array([0], dtype=cp.uint32)
 
-        a_bits = self._bit_length(a)
+        # a is trimmed and a > b >= 1, so a is non-zero: its bit length needs no
+        # re-trim, just the top limb's bit_length (one unavoidable read).
+        a_bits = (len(a) - 1) * 32 + int(a[-1]).bit_length()
 
         # p = smallest multiple of 32 that is >= a_bits.
         # With p >= a_bits, the approximation q0 satisfies q-1 <= q0 <= q,
