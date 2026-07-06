@@ -410,6 +410,147 @@ void addsub_small(
 ''', 'addsub_small')
 
 
+# ===========================================================================
+# NTT-based multiplication over the Goldilocks prime p = 2^64 - 2^32 + 1.
+#
+# Replaces the float64 FFT convolution with exact modular arithmetic: every
+# coefficient is computed mod p, so there is no rounding and the product is
+# exact at any size (unlike the FFT path, which had to shrink the chunk width
+# to keep IFFT coefficients inside float64's exact-integer range).
+#
+# p has 2-adicity 32 (p-1 = 2^32 * (2^32-1)), so any power-of-two transform
+# length up to 2^32 has a primitive root; 7 is a primitive root of p.  128->64
+# bit reduction uses 2^64 = 2^32-1 and 2^96 = -1 (mod p) — a couple of branches
+# and one multiply, no Montgomery/Barrett.  Column sums land in one uint64 and
+# feed the same carry-resolution pipeline as the schoolbook/FFT paths.
+# ---------------------------------------------------------------------------
+_GL_P = (1 << 64) - (1 << 32) + 1        # 0xFFFFFFFF00000001, prime
+_GL_PRIMITIVE_ROOT = 7
+
+# Shared device functions prepended to every NTT kernel source.
+_GL_PREAMBLE = r'''
+#define GL_P   18446744069414584321ULL   /* 2^64 - 2^32 + 1 */
+#define GL_EPS 0xFFFFFFFFULL             /* 2^32 - 1  ( = 2^64 mod p) */
+
+/* Reduce a 128-bit value hi*2^64 + lo into [0, p).  Valid for ANY 128-bit
+   input (the hi/lo halves need not be canonical).  Uses
+       2^64 = 2^32 - 1  and  2^96 = -1  (mod p),
+   so with hi = h1*2^32 + h0:  x = lo + (2^32-1)*h0 - h1  (mod p). */
+__device__ __forceinline__ unsigned long long gl_reduce128(
+        unsigned long long hi, unsigned long long lo)
+{
+    unsigned long long h0 = hi & GL_EPS;
+    unsigned long long h1 = hi >> 32;
+    unsigned long long t  = lo - h1;
+    if (lo < h1) t -= GL_EPS;            /* borrow: wrapped by +2^64 = +EPS */
+    unsigned long long u = h0 * GL_EPS;  /* < 2^64, exact */
+    unsigned long long r = t + u;
+    if (r < t) r += GL_EPS;              /* carry: wrapped by -2^64 = -EPS */
+    if (r >= GL_P) r -= GL_P;
+    return r;
+}
+
+__device__ __forceinline__ unsigned long long gl_mulmod(
+        unsigned long long a, unsigned long long b)
+{
+    return gl_reduce128(__umul64hi(a, b), a * b);
+}
+
+/* add/sub assume canonical inputs (< p) and return canonical outputs. */
+__device__ __forceinline__ unsigned long long gl_addmod(
+        unsigned long long a, unsigned long long b)
+{
+    unsigned long long s = a + b;
+    if (s < a) s += GL_EPS;              /* overflow past 2^64 = +EPS mod p */
+    if (s >= GL_P) s -= GL_P;
+    return s;
+}
+
+__device__ __forceinline__ unsigned long long gl_submod(
+        unsigned long long a, unsigned long long b)
+{
+    unsigned long long s = a - b;
+    if (a < b) s -= GL_EPS;              /* borrow: -2^64 = -EPS mod p */
+    return s;
+}
+'''
+
+# Fill w[k] = base^k mod p for k in [0, m).  One thread per k, square-and-
+# multiply over the (<= 31-bit) exponent k.  Used to build twiddle tables.
+_gl_fill_powers_kernel = cp.RawKernel(_GL_PREAMBLE + r'''
+extern "C" __global__
+void gl_fill_powers(unsigned long long* w, unsigned long long base, int m)
+{
+    int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= m) return;
+    unsigned long long result = 1ULL;
+    unsigned long long b = base;
+    unsigned int e = (unsigned int)k;
+    while (e) {
+        if (e & 1u) result = gl_mulmod(result, b);
+        b = gl_mulmod(b, b);
+        e >>= 1;
+    }
+    w[k] = result;
+}
+''', 'gl_fill_powers')
+
+# One DIF (Gentleman-Sande) butterfly stage, in-place.  idx in [0, n_half):
+#   block = idx >> log_half,  j = idx & (half-1)
+#   i0 = block*(2*half) + j,  i1 = i0 + half
+# Twiddle index j*tw_stride < n_half = len(w).  Natural-order in -> bit-reversed
+# out over the whole forward transform (stages run half = n/2 down to 1).
+_ntt_dif_stage_kernel = cp.RawKernel(_GL_PREAMBLE + r'''
+extern "C" __global__
+void ntt_dif_stage(unsigned long long* a, const unsigned long long* w,
+                   int n_half, int half, int log_half, int tw_stride)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_half) return;
+    int j = idx & (half - 1);
+    size_t i0 = ((size_t)(idx >> log_half) << (log_half + 1)) | (size_t)j;
+    size_t i1 = i0 + (size_t)half;
+    unsigned long long u = a[i0];
+    unsigned long long v = a[i1];
+    a[i0] = gl_addmod(u, v);
+    a[i1] = gl_mulmod(gl_submod(u, v), w[(size_t)j * (size_t)tw_stride]);
+}
+''', 'ntt_dif_stage')
+
+# One DIT (Cooley-Tukey) inverse butterfly stage, in-place, with winv[k]=w^-k.
+# Same index arithmetic as the DIF stage; stages run half = 1 up to n/2, taking
+# bit-reversed input back to natural order.  The 1/n scaling is NOT applied
+# here — it is folded into the pointwise kernel.
+_ntt_dit_inv_stage_kernel = cp.RawKernel(_GL_PREAMBLE + r'''
+extern "C" __global__
+void ntt_dit_inv_stage(unsigned long long* a, const unsigned long long* winv,
+                       int n_half, int half, int log_half, int tw_stride)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_half) return;
+    int j = idx & (half - 1);
+    size_t i0 = ((size_t)(idx >> log_half) << (log_half + 1)) | (size_t)j;
+    size_t i1 = i0 + (size_t)half;
+    unsigned long long u = a[i0];
+    unsigned long long t = gl_mulmod(a[i1], winv[(size_t)j * (size_t)tw_stride]);
+    a[i0] = gl_addmod(u, t);
+    a[i1] = gl_submod(u, t);
+}
+''', 'ntt_dit_inv_stage')
+
+# Fused pointwise product + 1/n scaling: a[k] <- a[k]*b[k]*scale mod p.
+# b may alias a (squaring): the kernel only reads b, so it is safe.
+_ntt_pointwise_scale_kernel = cp.RawKernel(_GL_PREAMBLE + r'''
+extern "C" __global__
+void ntt_pointwise_scale(unsigned long long* a, const unsigned long long* b,
+                         unsigned long long scale, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    a[idx] = gl_mulmod(gl_mulmod(a[idx], b[idx]), scale);
+}
+''', 'ntt_pointwise_scale')
+
 
 class GPUBigInt:
     def __init__(self, max_bits=1_000_000):
@@ -424,6 +565,11 @@ class GPUBigInt:
         self._fft_buf_b = cp.empty(0, dtype=cp.float64)
         self._fft_carry_ping = cp.empty(0, dtype=cp.int64)
         self._fft_carry_pong = cp.empty(0, dtype=cp.int64)
+        # NTT workspace (uint64 mod-p coefficient pads) and twiddle-table cache
+        # keyed by transform length n.  Grown lazily by _ensure_ntt_capacity().
+        self._ntt_buf_a = cp.empty(0, dtype=cp.uint64)
+        self._ntt_buf_b = cp.empty(0, dtype=cp.uint64)
+        self._ntt_tables: dict[int, tuple] = {}
         self._ensure_capacity((max_bits + 31) // 32)
 
     def _ensure_capacity(self, n: int) -> None:
@@ -468,6 +614,123 @@ class GPUBigInt:
             self._fft_buf_a = cp.empty(n_fft, dtype=cp.float64)
             self._fft_buf_b = cp.empty(n_fft, dtype=cp.float64)
         self._ensure_carry_capacity(n_fft + 1)
+
+    def _ensure_ntt_capacity(self, n: int) -> None:
+        """Grow the uint64 NTT coefficient pads (and the shared int64 carry
+        buffers) to handle a transform of length n.  Amortised: never shrinks."""
+        if n > len(self._ntt_buf_a):
+            self._ntt_buf_a = cp.empty(n, dtype=cp.uint64)
+            self._ntt_buf_b = cp.empty(n, dtype=cp.uint64)
+        self._ensure_carry_capacity(n + 1)
+
+    def _get_ntt_tables(self, n: int):
+        """Return (w_fwd, w_inv, inv_n) for transform length n (a power of two).
+
+        w_fwd[k] = w_n^k and w_inv[k] = w_n^-k for k in [0, n/2), where w_n is a
+        primitive n-th root of unity mod p; inv_n = n^-1 mod p (Python int).
+        Cached per n like a cuFFT plan — the roots are generated once on the GPU
+        by the square-and-multiply fill kernel."""
+        cached = self._ntt_tables.get(n)
+        if cached is not None:
+            return cached
+        half = max(1, n // 2)
+        w_n = pow(_GL_PRIMITIVE_ROOT, (_GL_P - 1) // n, _GL_P)
+        w_n_inv = pow(w_n, _GL_P - 2, _GL_P)
+        inv_n = pow(n, _GL_P - 2, _GL_P)
+        w_fwd = cp.empty(half, dtype=cp.uint64)
+        w_inv = cp.empty(half, dtype=cp.uint64)
+        blocks = (half + _BLOCK - 1) // _BLOCK
+        _gl_fill_powers_kernel((blocks,), (_BLOCK,), (w_fwd, np.uint64(w_n), half))
+        _gl_fill_powers_kernel((blocks,), (_BLOCK,), (w_inv, np.uint64(w_n_inv), half))
+        tables = (w_fwd, w_inv, inv_n)
+        self._ntt_tables[n] = tables
+        return tables
+
+    def _ntt_forward(self, a, n, w_fwd):
+        """In-place forward NTT (DIF): natural order -> bit-reversed order.
+        Stages run half = n/2 down to 1, one kernel launch each (launch bounds
+        act as the inter-stage global barrier)."""
+        n_half = n >> 1
+        if n_half == 0:
+            return
+        blocks = (n_half + _BLOCK - 1) // _BLOCK
+        half = n_half
+        log_half = n.bit_length() - 2   # == log2(n_half)
+        while half >= 1:
+            tw_stride = n_half // half
+            _ntt_dif_stage_kernel(
+                (blocks,), (_BLOCK,),
+                (a, w_fwd, n_half, half, log_half, tw_stride))
+            half >>= 1
+            log_half -= 1
+
+    def _ntt_inverse(self, a, n, w_inv):
+        """In-place inverse NTT (DIT): bit-reversed order -> natural order.
+        Stages run half = 1 up to n/2.  The 1/n factor is applied separately
+        (folded into the pointwise kernel)."""
+        n_half = n >> 1
+        if n_half == 0:
+            return
+        blocks = (n_half + _BLOCK - 1) // _BLOCK
+        half = 1
+        log_half = 0
+        while half <= n_half:
+            tw_stride = n_half // half
+            _ntt_dit_inv_stage_kernel(
+                (blocks,), (_BLOCK,),
+                (a, w_inv, n_half, half, log_half, tw_stride))
+            half <<= 1
+            log_half += 1
+
+    def _mul_ntt(self, a_gpu, b_gpu, is_square=False):
+        """Exact big-integer multiply via NTT over the Goldilocks prime.
+
+        Same contract as _mul_fft: uint32 little-endian limb arrays in, a uint32
+        limb array (<= la+lb limbs) out.  16-bit chunks are convolved mod p (no
+        rounding, exact at any size), then the resulting base-2^16 column sums
+        run through the shared carry-resolution pipeline.  is_square (a_gpu is
+        b_gpu) does one forward transform and squares it pointwise."""
+        chunk_bits = 16
+        a_ch = cp.ascontiguousarray(a_gpu).view(cp.uint16)
+        b_ch = a_ch if is_square else cp.ascontiguousarray(b_gpu).view(cp.uint16)
+        n_a, n_b = len(a_ch), len(b_ch)
+        # Column sums are < min_chunks*(2^16-1)^2; this keeps them < 2^63 for the
+        # int64 carry pipeline (also << p, so the mod-p transform is exact).
+        assert min(n_a, n_b) * (0xFFFF ** 2) < (1 << 63)
+
+        n_conv = n_a + n_b - 1
+        n = 1 << max(0, n_conv - 1).bit_length()   # next power of two >= n_conv
+
+        w_fwd, w_inv, inv_n = self._get_ntt_tables(n)
+        self._ensure_ntt_capacity(n)
+
+        fa = self._ntt_buf_a[:n]
+        fa[:n_a] = a_ch          # cast uint16 -> uint64 on assignment
+        fa[n_a:] = 0             # clear pad tail (buffer is reused)
+        self._ntt_forward(fa, n, w_fwd)
+        if is_square:
+            fb = fa
+        else:
+            fb = self._ntt_buf_b[:n]
+            fb[:n_b] = b_ch
+            fb[n_b:] = 0
+            self._ntt_forward(fb, n, w_fwd)   # forward uses w_fwd for both
+
+        blocks = (n + _BLOCK - 1) // _BLOCK
+        _ntt_pointwise_scale_kernel(
+            (blocks,), (_BLOCK,), (fa, fb, np.uint64(inv_n), n))
+        self._ntt_inverse(fa, n, w_inv)
+
+        # Feed the exact column sums into the shared carry pipeline.
+        carry_n = n + 1
+        self._ensure_carry_capacity(carry_n)   # before slicing the ping buffer
+        ping = self._fft_carry_ping[:carry_n]
+        ping[:n] = fa            # uint64 -> int64 cast; values < 2^63 (see assert)
+        ping[n] = 0              # carry-out slot
+        max_bits = 2 * chunk_bits + min(n_a, n_b).bit_length()
+        ping = self._resolve_carries(carry_n, chunk_bits, max_bits)
+        return self._recombine_chunks(ping, carry_n, chunk_bits,
+                                      len(a_gpu) + len(b_gpu))
 
     def _scan(self, states, n, _level=0):
         blocks = (n + _BLOCK - 1) // _BLOCK
