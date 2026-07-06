@@ -807,16 +807,16 @@ class GPUBigInt:
         return self._addsub_trimmed(a_gpu, b_gpu, True)
 
     def mul(self, a_gpu, b_gpu):
-        # Dispatch (Phase 2).  For small per-column work an all-GPU schoolbook
-        # kernel avoids the FFT's plan/malloc overhead and any host roundtrip;
-        # above the threshold the O(n log n) FFT wins over O(n^2) columns.
+        # Dispatch.  For small per-column work an all-GPU schoolbook kernel
+        # avoids the transform's plan/malloc overhead and any host roundtrip;
+        # above the threshold the O(n log n) NTT wins over O(n^2) columns.
         la, lb = len(a_gpu), len(b_gpu)
         if la * lb <= _MUL_SCHOOLBOOK_MAX_WORK:
             return self._mul_schoolbook(a_gpu, b_gpu)
-        # Phase 3: squaring (same array object for both operands, as produced by
-        # __pow__'s repeated squarings) lets the FFT path skip the second operand
-        # fill and its forward transform — one rfft instead of two.
-        return self._mul_fft(a_gpu, b_gpu, is_square=a_gpu is b_gpu)
+        # Squaring (same array object for both operands, as produced by __pow__'s
+        # repeated squarings) lets the transform skip the second operand fill and
+        # its forward transform — one forward NTT instead of two.
+        return self._mul_ntt(a_gpu, b_gpu, is_square=a_gpu is b_gpu)
 
     def _resolve_carries(self, carry_n, chunk_bits, max_bits):
         """Resolve base-2^chunk_bits column sums into final chunk values.
