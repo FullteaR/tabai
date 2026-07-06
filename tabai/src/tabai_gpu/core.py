@@ -5,19 +5,20 @@ _BLOCK = 256
 
 _ONE = cp.array([1], dtype=cp.uint32)
 
-# Mul dispatch (Phase 2).  For operands whose per-column work la*lb is at most
-# this many limb-pairs, an all-GPU schoolbook kernel (base-2^16 column sums fed
-# into the shared carry-resolution pipeline) beats cuFFT: it has no cudaMalloc /
-# FFT-plan overhead and, crucially, no GPU->CPU->GPU roundtrip like the old
-# Python-int * path.  Above the threshold the O(n^2) column work loses to the
-# FFT's O(n log n) and we switch to _mul_fft.
+# Mul dispatch.  For operands whose per-column work la*lb is at most this many
+# limb-pairs, an all-GPU schoolbook kernel (base-2^16 column sums fed into the
+# shared carry-resolution pipeline) beats the transform: it has no plan/malloc
+# overhead and no GPU->CPU->GPU roundtrip.  Above the threshold the O(n^2) column
+# work loses to the NTT's O(n log n) and we switch to _mul_ntt.
 #
 # Tuned by sweep on an RTX 3090: for balanced (square) operands — the worst case
 # for schoolbook at a fixed la*lb, since they maximise the longest column loop —
-# the crossover is L ~= 5120 limbs (work ~= 26M).  Below it schoolbook wins
-# decisively (~2x at L=4096); asymmetric operands of equal work win by more, so
-# la*lb is a conservative routing metric.  isqrt(threshold) == 5120 exactly.
-_MUL_SCHOOLBOOK_MAX_WORK = 5120 * 5120  # la*lb limb-pairs (26_214_400)
+# the schoolbook/NTT crossover is L ~= 6016 limbs.  Below it schoolbook wins
+# (~1.75x at L=3072); asymmetric operands of equal work win by more, so la*lb is
+# a conservative routing metric.  isqrt(threshold) == 6016 exactly.  (It rose
+# from 5120 with the FFT->NTT switch: the NTT's forward-transform floor is a
+# touch higher, so schoolbook stays ahead a little further.)
+_MUL_SCHOOLBOOK_MAX_WORK = 6016 * 6016  # la*lb limb-pairs (36_192_256)
 
 # divmod's reciprocal step. Below this size, computing floor(2^p / b) with
 # Python's int // is faster than running ~log2(p/53) GPU FFT mul iterations.
