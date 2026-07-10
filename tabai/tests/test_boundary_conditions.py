@@ -20,13 +20,13 @@ _U32 = 2**32
 _U64_MAX = 2**64 - 1
 _U64 = 2**64
 
-# Schoolbook/FFT mul dispatch threshold  (core.py: _MUL_SCHOOLBOOK_MAX_WORK = 5120*5120).
-# Dispatch is on work = la*lb limb-pairs; isqrt(threshold) == 5120, so a square
-# 5120-limb operand pair is the last schoolbook-path size and 5121 the first FFT.
-_MUL_SCHOOLBOOK_L = 5120          # isqrt(_MUL_SCHOOLBOOK_MAX_WORK)
-_MUL_SCHOOLBOOK_BITS = _MUL_SCHOOLBOOK_L * 32   # 163840 bits — last schoolbook size
-_MUL_FFT_L = 5121                 # first FFT-path size (square)
-_MUL_FFT_BITS = _MUL_FFT_L * 32   # 163872 bits
+# Schoolbook/NTT mul dispatch threshold  (core.py: _MUL_SCHOOLBOOK_MAX_WORK = 6016*6016).
+# Dispatch is on work = la*lb limb-pairs; isqrt(threshold) == 6016, so a square
+# 6016-limb operand pair is the last schoolbook-path size and 6017 the first NTT.
+_MUL_SCHOOLBOOK_L = 6016          # isqrt(_MUL_SCHOOLBOOK_MAX_WORK)
+_MUL_SCHOOLBOOK_BITS = _MUL_SCHOOLBOOK_L * 32   # 192512 bits — last schoolbook size
+_MUL_NTT_L = 6017                 # first NTT-path size (square)
+_MUL_NTT_BITS = _MUL_NTT_L * 32   # 192544 bits
 
 # Newton reciprocal threshold for divmod  (core.py: _DIV_NEWTON_THRESHOLD_LIMBS = 5120)
 _NEWTON_LIMBS = 5120
@@ -144,27 +144,27 @@ class TestMulLimbBoundary:
 
 
 # =========================================================================
-# 4. Mul at schoolbook / FFT dispatch threshold (work = la*lb, isqrt = 5120)
+# 4. Mul at schoolbook / NTT dispatch threshold (work = la*lb, isqrt = 6016)
 # =========================================================================
 
-class TestMulSchoolbookFftThreshold:
+class TestMulSchoolbookNttThreshold:
 
     def test_mul_at_schoolbook_threshold(self):
-        # work = 5120*5120 == threshold → schoolbook path (last eligible size).
+        # work = 6016*6016 == threshold → schoolbook path (last eligible size).
         a = (1 << _MUL_SCHOOLBOOK_BITS) - 1
         b = (1 << _MUL_SCHOOLBOOK_BITS) - 1
         assert (TabaiInt(a) * TabaiInt(b)).to_cpu() == a * b
 
     def test_mul_just_above_schoolbook_threshold(self):
-        # work = 5121*5121 > threshold → FFT path.
-        a = (1 << _MUL_FFT_BITS) - 1
-        b = (1 << _MUL_FFT_BITS) - 1
+        # work = 6017*6017 > threshold → NTT path.
+        a = (1 << _MUL_NTT_BITS) - 1
+        b = (1 << _MUL_NTT_BITS) - 1
         assert (TabaiInt(a) * TabaiInt(b)).to_cpu() == a * b
 
     def test_mul_mixed_operand_crosses_threshold(self):
-        # 5120 x 5121 limbs: work = 5120*5121 > threshold → FFT path.
+        # 6016 x 6017 limbs: work = 6016*6017 > threshold → NTT path.
         a = (1 << _MUL_SCHOOLBOOK_BITS) - 1
-        b = (1 << _MUL_FFT_BITS) - 1
+        b = (1 << _MUL_NTT_BITS) - 1
         assert (TabaiInt(a) * TabaiInt(b)).to_cpu() == a * b
 
     def test_mul_asymmetric_low_work_stays_schoolbook(self):
@@ -182,14 +182,14 @@ class TestMulSchoolbookFftThreshold:
 
     def test_mul_all_ones_stress(self):
         # All-0xFFFFFFFF limbs maximise every column sum (worst carry chains).
-        for nlimbs in [2048, 5120, 5121]:
+        for nlimbs in [2048, 6016, 6017]:
             a = (1 << (nlimbs * 32)) - 1
             assert (TabaiInt(a) * TabaiInt(a)).to_cpu() == a * a
 
     @pytest.mark.parametrize("la,lb", [
         (1, 1), (2, 2), (31, 31), (32, 32), (33, 33),
         (1, 33), (2, 2048), (2047, 2047), (2048, 2048), (2049, 2049),
-        (33, 5120), (5120, 5121),
+        (33, 6016), (6016, 6017),
     ])
     def test_mul_random_limb_counts(self, la, lb):
         rng = random.Random(1000 * la + lb)
