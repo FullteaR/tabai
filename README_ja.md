@@ -1,15 +1,15 @@
 # tabai
 
-GPU-accelerated arbitrary-precision integer arithmetic library for Python.
+GPU を活用した Python 向け任意精度整数演算ライブラリ。
 
-Perform addition, subtraction, multiplication, and division on huge integers using NVIDIA GPU parallelism via CUDA.
+CUDA による NVIDIA GPU 並列処理を利用し、巨大な整数の加算・減算・乗算・除算を高速に実行します。
 
-## Requirements
+## 必要環境
 
 - Docker
-- NVIDIA GPU with CUDA support
+- CUDA 対応の NVIDIA GPU
 
-## Setup
+## セットアップ
 
 ```bash
 docker-compose build
@@ -17,7 +17,7 @@ docker-compose up -d
 docker-compose exec tabai bash
 ```
 
-## Usage
+## 使い方
 
 ```python
 from tabai_gpu import TabaiInt
@@ -30,7 +30,7 @@ print(c.to_cpu())
 #>> 3
 ```
 
-### Arithmetic Operations
+### 四則演算
 
 ```python
 from tabai_gpu import TabaiInt
@@ -38,27 +38,27 @@ from tabai_gpu import TabaiInt
 a = TabaiInt(10 ** 100)
 b = TabaiInt(20 ** 100)
 
-# Addition
+# 加算
 c = a + b
 print(c.to_cpu())
 #>> 12676506002282294014967032053770000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
 
-# Subtraction
+# 減算
 d = b - a
 print(d.to_cpu())
 #>> 12676506002282294014967032053750000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
 
-# Multiplication
+# 乗算
 e = TabaiInt(123456789) * TabaiInt(987654321)
 print(e.to_cpu())
 #>> 121932631112635269
 
-# Floor Division
+# 整数除算
 f = TabaiInt(100) // TabaiInt(3)
 print(f.to_cpu())
 #>> 33
 
-# Modulo
+# 剰余
 g = TabaiInt(100) % TabaiInt(3)
 print(g.to_cpu())
 #>> 1
@@ -69,12 +69,12 @@ print(q.to_cpu(), r.to_cpu())
 #>> 14 2
 ```
 
-## Running Tests
+## テストの実行
 
 ```bash
 pytest tabai/tests/test_operations.py
 ```
 
-## License
+## ライセンス
 
 MIT
