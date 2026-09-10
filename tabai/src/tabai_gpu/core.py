@@ -1,9 +1,12 @@
+from contextvars import ContextVar
+
 import cupy as cp
 import numpy as np
 
 _BLOCK = 256
 
-_ONE = cp.array([1], dtype=cp.uint32)
+# Scoped optional distributed multiplier; unset on the ordinary single-GPU path.
+_distributed_multiplier = ContextVar("tabai_distributed_multiplier", default=None)
 
 # Mul dispatch.  For operands whose per-column work la*lb is at most this many
 # limb-pairs, an all-GPU schoolbook kernel (base-2^16 column sums fed into the
@@ -539,6 +542,103 @@ void ntt_dit_inv_stage(unsigned long long* a, const unsigned long long* winv,
 }
 ''', 'ntt_dit_inv_stage')
 
+# Two global stages per pass. Each thread owns four coefficients throughout
+# both butterflies, so the intermediate values stay in registers. This halves
+# full-array traffic without requiring synchronization between thread blocks.
+_ntt_dif_pair_kernel = cp.RawKernel(_GL_PREAMBLE + r'''
+extern "C" __global__
+void ntt_dif_pair(unsigned long long* a, const unsigned long long* w,
+                  int n_quarter, int quarter, int log_quarter, int stride)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_quarter) return;
+    int j = idx & (quarter - 1);
+    size_t i = ((size_t)(idx >> log_quarter) << (log_quarter + 2)) | (size_t)j;
+    unsigned long long x0 = a[i], x1 = a[i + quarter];
+    unsigned long long x2 = a[i + 2 * (size_t)quarter];
+    unsigned long long x3 = a[i + 3 * (size_t)quarter];
+    unsigned long long w0 = w[(size_t)j * stride];
+    unsigned long long w1 = w[(size_t)(j + quarter) * stride];
+    unsigned long long w2 = w[(size_t)j * (2 * (size_t)stride)];
+    unsigned long long t0 = gl_addmod(x0, x2);
+    unsigned long long t1 = gl_addmod(x1, x3);
+    unsigned long long t2 = gl_mulmod(gl_submod(x0, x2), w0);
+    unsigned long long t3 = gl_mulmod(gl_submod(x1, x3), w1);
+    a[i] = gl_addmod(t0, t1);
+    a[i + quarter] = gl_mulmod(gl_submod(t0, t1), w2);
+    a[i + 2 * (size_t)quarter] = gl_addmod(t2, t3);
+    a[i + 3 * (size_t)quarter] = gl_mulmod(gl_submod(t2, t3), w2);
+}
+''', 'ntt_dif_pair')
+
+_ntt_dit_inv_pair_kernel = cp.RawKernel(_GL_PREAMBLE + r'''
+extern "C" __global__
+void ntt_dit_inv_pair(unsigned long long* a, const unsigned long long* w,
+                      int n_quarter, int quarter, int log_quarter, int stride)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_quarter) return;
+    int j = idx & (quarter - 1);
+    size_t i = ((size_t)(idx >> log_quarter) << (log_quarter + 2)) | (size_t)j;
+    unsigned long long x0 = a[i], x1 = a[i + quarter];
+    unsigned long long x2 = a[i + 2 * (size_t)quarter];
+    unsigned long long x3 = a[i + 3 * (size_t)quarter];
+    unsigned long long w0 = w[(size_t)j * stride];
+    unsigned long long w1 = w[(size_t)(j + quarter) * stride];
+    unsigned long long w2 = w[(size_t)j * (2 * (size_t)stride)];
+    x1 = gl_mulmod(x1, w2);
+    x3 = gl_mulmod(x3, w2);
+    unsigned long long t0 = gl_addmod(x0, x1);
+    unsigned long long t1 = gl_submod(x0, x1);
+    unsigned long long t2 = gl_mulmod(gl_addmod(x2, x3), w0);
+    unsigned long long t3 = gl_mulmod(gl_submod(x2, x3), w1);
+    a[i] = gl_addmod(t0, t2);
+    a[i + quarter] = gl_addmod(t1, t3);
+    a[i + 2 * (size_t)quarter] = gl_submod(t0, t2);
+    a[i + 3 * (size_t)quarter] = gl_submod(t1, t3);
+}
+''', 'ntt_dit_inv_pair')
+
+# The final forward / initial inverse stages only communicate within a tile.
+# Read/write global coefficients once and use block barriers in shared memory
+# between these stages. The twiddle stride still refers to the full transform.
+_NTT_TILE = 1024
+_ntt_tile_kernel = cp.RawKernel(_GL_PREAMBLE + r'''
+extern "C" __global__
+void ntt_tile(unsigned long long* a, const unsigned long long* w,
+              int n, int tile, int inverse)
+{
+    extern __shared__ unsigned long long values[];
+    int t = threadIdx.x;
+    size_t base = (size_t)blockIdx.x * tile;
+    values[t] = a[base + t];
+    values[t + tile / 2] = a[base + t + tile / 2];
+    __syncthreads();
+    if (inverse) {
+        for (int half = 1; half < tile; half <<= 1) {
+            int j = t & (half - 1);
+            int i = 2 * (t - j) + j;
+            unsigned long long u = values[i];
+            unsigned long long v = gl_mulmod(values[i + half], w[(size_t)j * (n / (2 * half))]);
+            values[i] = gl_addmod(u, v);
+            values[i + half] = gl_submod(u, v);
+            __syncthreads();
+        }
+    } else {
+        for (int half = tile / 2; half; half >>= 1) {
+            int j = t & (half - 1);
+            int i = 2 * (t - j) + j;
+            unsigned long long u = values[i], v = values[i + half];
+            values[i] = gl_addmod(u, v);
+            values[i + half] = gl_mulmod(gl_submod(u, v), w[(size_t)j * (n / (2 * half))]);
+            __syncthreads();
+        }
+    }
+    a[base + t] = values[t];
+    a[base + t + tile / 2] = values[t + tile / 2];
+}
+''', 'ntt_tile')
+
 # Fused pointwise product + 1/n scaling: a[k] <- a[k]*b[k]*scale mod p.
 # b may alias a (squaring): the kernel only reads b, so it is safe.
 _ntt_pointwise_scale_kernel = cp.RawKernel(_GL_PREAMBLE + r'''
@@ -555,6 +655,8 @@ void ntt_pointwise_scale(unsigned long long* a, const unsigned long long* b,
 
 class GPUBigInt:
     def __init__(self, max_bits=1_000_000):
+        self.device_id = cp.cuda.runtime.getDevice()
+        self._one = cp.array([1], dtype=cp.uint32)
         self._scan_dummy = cp.empty(1, dtype=cp.int32)
         self._trim_idx_buf = cp.empty(1, dtype=cp.int32)
         self._compare_buf = cp.empty(1, dtype=cp.uint64)
@@ -602,12 +704,11 @@ class GPUBigInt:
         self._carry_pong = cp.empty(carry_n, dtype=cp.int64)
 
     def _ensure_ntt_capacity(self, n: int) -> None:
-        """Grow the uint64 NTT coefficient pads (and the shared int64 carry
-        buffers) to handle a transform of length n.  Amortised: never shrinks."""
+        """Grow uint64 transform pads. Carry storage uses the shorter linear
+        convolution length, not the power-of-two padded transform length."""
         if n > len(self._ntt_buf_a):
             self._ntt_buf_a = cp.empty(n, dtype=cp.uint64)
             self._ntt_buf_b = cp.empty(n, dtype=cp.uint64)
-        self._ensure_carry_capacity(n + 1)
 
     def _get_ntt_tables(self, n: int):
         """Return (w_fwd, w_inv, inv_n) for transform length n (a power of two).
@@ -633,40 +734,50 @@ class GPUBigInt:
         return tables
 
     def _ntt_forward(self, a, n, w_fwd):
-        """In-place forward NTT (DIF): natural order -> bit-reversed order.
-        Stages run half = n/2 down to 1, one kernel launch each (launch bounds
-        act as the inter-stage global barrier)."""
-        n_half = n >> 1
-        if n_half == 0:
+        """In-place DIF: register-fused global stages, then a shared tile."""
+        if n < 2:
             return
-        blocks = (n_half + _BLOCK - 1) // _BLOCK
-        half = n_half
-        log_half = n.bit_length() - 2   # == log2(n_half)
-        while half >= 1:
-            tw_stride = n_half // half
-            _ntt_dif_stage_kernel(
-                (blocks,), (_BLOCK,),
-                (a, w_fwd, n_half, half, log_half, tw_stride))
-            half >>= 1
-            log_half -= 1
+        tile = min(n, _NTT_TILE)
+        half = n // 2
+        log_half = n.bit_length() - 2
+        while half >= tile:
+            if half >= 2 * tile:
+                _ntt_dif_pair_kernel(
+                    (((n // 4) + _BLOCK - 1) // _BLOCK,), (_BLOCK,),
+                    (a, w_fwd, n // 4, half // 2, log_half - 1, n // (2 * half)))
+                half >>= 2
+                log_half -= 2
+            else:
+                _ntt_dif_stage_kernel(
+                    (((n // 2) + _BLOCK - 1) // _BLOCK,), (_BLOCK,),
+                    (a, w_fwd, n // 2, half, log_half, n // (2 * half)))
+                half >>= 1
+                log_half -= 1
+        _ntt_tile_kernel((n // tile,), (tile // 2,),
+                         (a, w_fwd, n, tile, 0), shared_mem=tile * 8)
 
     def _ntt_inverse(self, a, n, w_inv):
-        """In-place inverse NTT (DIT): bit-reversed order -> natural order.
-        Stages run half = 1 up to n/2.  The 1/n factor is applied separately
-        (folded into the pointwise kernel)."""
-        n_half = n >> 1
-        if n_half == 0:
+        """In-place DIT: shared tile then global pairs; scaling is separate."""
+        if n < 2:
             return
-        blocks = (n_half + _BLOCK - 1) // _BLOCK
-        half = 1
-        log_half = 0
-        while half <= n_half:
-            tw_stride = n_half // half
-            _ntt_dit_inv_stage_kernel(
-                (blocks,), (_BLOCK,),
-                (a, w_inv, n_half, half, log_half, tw_stride))
-            half <<= 1
-            log_half += 1
+        tile = min(n, _NTT_TILE)
+        _ntt_tile_kernel((n // tile,), (tile // 2,),
+                         (a, w_inv, n, tile, 1), shared_mem=tile * 8)
+        half = tile
+        log_half = tile.bit_length() - 1
+        while half < n:
+            if 4 * half <= n:
+                _ntt_dit_inv_pair_kernel(
+                    (((n // 4) + _BLOCK - 1) // _BLOCK,), (_BLOCK,),
+                    (a, w_inv, n // 4, half, log_half, n // (4 * half)))
+                half <<= 2
+                log_half += 2
+            else:
+                _ntt_dit_inv_stage_kernel(
+                    (((n // 2) + _BLOCK - 1) // _BLOCK,), (_BLOCK,),
+                    (a, w_inv, n // 2, half, log_half, n // (2 * half)))
+                half <<= 1
+                log_half += 1
 
     def _mul_ntt(self, a_gpu, b_gpu, is_square=False):
         """Exact big-integer multiply via NTT over the Goldilocks prime.
@@ -708,11 +819,14 @@ class GPUBigInt:
         self._ntt_inverse(fa, n, w_inv)
 
         # Feed the exact column sums into the shared carry pipeline.
-        carry_n = n + 1
-        self._ensure_carry_capacity(carry_n)   # before slicing the ping buffer
+        # Cyclic-safe padding guarantees coefficients beyond n_conv are zero.
+        # Resolve only the linear convolution and its carry-out slot, avoiding
+        # whole-array carry passes over the power-of-two padding.
+        carry_n = n_conv + 1
+        self._ensure_carry_capacity(carry_n)
         ping = self._carry_ping[:carry_n]
-        ping[:n] = fa            # uint64 -> int64 cast; values < 2^63 (see assert)
-        ping[n] = 0              # carry-out slot
+        ping[:n_conv] = fa[:n_conv]  # uint64 -> int64; values < 2^63
+        ping[n_conv] = 0
         max_bits = 2 * chunk_bits + min(n_a, n_b).bit_length()
         ping = self._resolve_carries(carry_n, chunk_bits, max_bits)
         return self._recombine_chunks(ping, carry_n, chunk_bits,
@@ -799,6 +913,9 @@ class GPUBigInt:
         la, lb = len(a_gpu), len(b_gpu)
         if la * lb <= _MUL_SCHOOLBOOK_MAX_WORK:
             return self._mul_schoolbook(a_gpu, b_gpu)
+        distributed = _distributed_multiplier.get()
+        if distributed is not None and 32 * max(la, lb) >= distributed.min_bits:
+            return distributed.mul(self, a_gpu, b_gpu)
         # Squaring (same array object for both operands, as produced by __pow__'s
         # repeated squarings) lets the transform skip the second operand fill and
         # its forward transform — one forward NTT instead of two.
@@ -1118,7 +1235,7 @@ class GPUBigInt:
         for _ in range(4):
             bx_next = self.add(bx, b)
             if self._compare(bx_next, two_p) <= 0:
-                x = self.add(x, _ONE)
+                x = self.add(x, self._one)
                 bx = bx_next
             else:
                 break
@@ -1168,7 +1285,7 @@ class GPUBigInt:
         # q0 may be off by 1 (too low): if r >= b, correct once.
         if self._compare(r, b) >= 0:
             r = self.sub(r, b)
-            q0 = self.add(q0, _ONE)
+            q0 = self.add(q0, self._one)
 
         return self._trim(q0), self._trim(r)
 

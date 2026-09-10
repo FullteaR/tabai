@@ -240,7 +240,7 @@ def test_forward_inverse_roundtrip(calc, logn):
 
 # ---- 5. GPU forward vs Python oracle --------------------------------------
 @requires_ntt
-@pytest.mark.parametrize("n", [8, 64, 1024])
+@pytest.mark.parametrize("n", [8, 64, 256, 512, 1024, 2048, 4096, 16384])
 def test_forward_matches_reference(calc, n):
     rng = random.Random(7 + n)
     data = [rng.randrange(P) for _ in range(n)]
@@ -252,6 +252,28 @@ def test_forward_matches_reference(calc, n):
     ref = list(data)
     ref_ntt_dif(ref, w)
     assert np.array_equal(cp.asnumpy(buf), np.array(ref, dtype=np.uint64))
+
+
+@requires_ntt
+@pytest.mark.parametrize("n", [256, 512, 1024, 2048, 8192])
+def test_inverse_matches_reference_on_arbitrary_input(calc, n):
+    # Check the inverse independently: matching forward/inverse indexing bugs
+    # can cancel in a round-trip. Include canonical modular boundary values.
+    rng = random.Random(871 + n)
+    edge = [0, 1, P - 1, P - 2, (1 << 32) - 1, 1 << 32, 1 << 63]
+    data = edge + [rng.randrange(P) for _ in range(n - len(edge))]
+    _, w_inv, _ = calc._get_ntt_tables(n)
+    # Guard an offset view to catch writes outside this transform's interval.
+    guard = cp.full(n + 4, 123, dtype=cp.uint64)
+    buf = guard[2:n + 2]
+    buf[:] = cp.asarray(np.array(data, dtype=np.uint64))
+    calc._ntt_inverse(buf, n, w_inv)
+    root = pow(pow(PRIMITIVE_ROOT, (P - 1) // n, P), P - 2, P)
+    expected = data.copy()
+    ref_ntt_dit_inv(expected, [pow(root, k, P) for k in range(n // 2)])
+    assert cp.asnumpy(buf).tolist() == expected
+    assert cp.asnumpy(guard[:2]).tolist() == [123, 123]
+    assert cp.asnumpy(guard[-2:]).tolist() == [123, 123]
 
 
 # ---- 6. _mul_ntt vs Python int --------------------------------------------

@@ -1,0 +1,36 @@
+{
+  "python_version": "3.12.3",
+  "gmpy2_version": "2.3.1",
+  "gmp_version": "GMP 6.3.0",
+  "cpu_count": 28,
+  "cpu_model": "QEMU Virtual CPU version 2.5+",
+  "mem_total_kib": 4000680,
+  "kernel": "6.8.0-139-generic",
+  "cuda_library_path": "/usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64",
+  "gpu_driver": "index, name, driver_version, memory.total [MiB]\n0, NVIDIA GeForce RTX 3090, 580.173.02, 24576 MiB\n1, NVIDIA GeForce RTX 3090, 580.173.02, 24576 MiB\n",
+  "gpu_topology": "\t\u001b[4mGPU0\tGPU1\tCPU Affinity\tNUMA Affinity\tGPU NUMA ID\u001b[0m\nGPU0\t X \tPHB\t0-27\t0\t\tN/A\nGPU1\tPHB\t X \t0-27\t0\t\tN/A\n\nLegend:\n\n  X    = Self\n  SYS  = Connection traversing PCIe as well as the SMP interconnect between NUMA nodes (e.g., QPI/UPI)\n  NODE = Connection traversing PCIe as well as the interconnect between PCIe Host Bridges within a NUMA node\n  PHB  = Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU)\n  PXB  = Connection traversing multiple PCIe bridges (without traversing the PCIe Host Bridge)\n  PIX  = Connection traversing at most a single PCIe bridge\n  NV#  = Connection traversing a bonded set of # NVLinks\n",
+  "git_head": "805b3c81a92ccb89554a37b0e012ac10b5fa4d4d",
+  "source_note": "Measured working tree, including uncommitted changes; source SHA-256 identifies the measured files.",
+  "source_sha256": {
+    "tabai/benchmarks/__init__.py": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+    "tabai/benchmarks/bench_add.py": "a229ef6e1aea1e19975d1daa89dbf8c729e61a3f226751faede18b943ff220d8",
+    "tabai/benchmarks/bench_div.py": "959bb18520d61e8d96779fc3b28c6bcf2ba620f142749ddcb0a49a1097797bb2",
+    "tabai/benchmarks/bench_mul.py": "0ddd9b02d674b66b293abea9605fcaa4985be82b7fe59507b175b97826f1f3d9",
+    "tabai/benchmarks/bench_multi_gpu.py": "8423a5c6c17027ea056484ac909906b7ee85aa3fa33b37e5b2e218a8a31f7350",
+    "tabai/benchmarks/bench_pow.py": "b49d7aab152b7c1139eb274085e94e05266f26d773a0d0b46c33851b05ecf7e0",
+    "tabai/benchmarks/bench_sub.py": "63c2ddeb134ecd23c316908900f214a6b92447dd6ab3517c8f4b7b144308459f",
+    "tabai/benchmarks/benchmark.py": "3ceee65f72c00b80ab0c0563db99a4b31a839455455fcce224d7b472914fc566",
+    "tabai/benchmarks/common.py": "833af5646c6005b8a830c643451c13ea7208c0b1b8083b0e6d328fe63584f55c",
+    "tabai/benchmarks/runner.py": "e9fa031d9e202d6478f033d169003daeab1fc4fb342d9931f879ef8436746342",
+    "tabai/src/tabai_gpu/__init__.py": "53628e09de72d182e36b07ff54e4af843de2adc57bc845d2168d22defa55f3a2",
+    "tabai/src/tabai_gpu/core.py": "b7bce0318a15e3adac8a8870827a6176302553f2c519c6f298843734f57335ae",
+    "tabai/src/tabai_gpu/multi_gpu.py": "475ddd51ecea8fc9d6567c557e0b71cf3091572fa0e6d17b18972c7e4a2528b6",
+    "tabai/src/tabai_gpu/tabai_int.py": "37ff9e24b55cc5bd3d058bf8fe7a57c465e1287b2e5924910eaca00adf64c380",
+    "tabai/src/tabai_gpu/utils.py": "b12d767f76396d1eb393c5ca439e28dc0f3cddd29acaf6d65210ec13f421723a"
+  },
+  "validation": {
+    "cases": 79,
+    "measured": 553,
+    "warmup": 158
+  }
+}

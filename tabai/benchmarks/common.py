@@ -1,311 +1,255 @@
-"""
-Shared infrastructure for the tabai benchmarks.
-
-This module holds everything the individual benchmark files
-(``bench_add.py``, ``bench_mul.py`` …) need in common: random-input
-generation, timing, the per-backend wrapper classes, and the row/header
-printing helpers.
-
-Each ``bench_*.py`` file imports from here and exposes a ``run(backends)``
-function plus a ``main()`` so it can be executed on its own:
-
-    python benchmarks/bench_add.py
-
-``benchmark.py`` imports every ``bench_*`` module and runs them in sequence.
-
-Requirements:
-    - cupy (included in the Docker image)
-    - gmpy2: pip install gmpy2
-"""
-
+"""Deterministic inputs, backend adapters and timing (no eager CUDA imports)."""
 from __future__ import annotations
 
+from contextlib import contextmanager, nullcontext
+import hashlib
+import operator
 import random
 import statistics
-import sys
 import time
-from typing import Callable
-
-# ---------------------------------------------------------------------------
-# Try importing each backend
-# ---------------------------------------------------------------------------
-try:
-    from tabai_gpu import TabaiInt
-    import cupy as cp
-
-    HAS_TABAI = True
-except ImportError:
-    HAS_TABAI = False
-    cp = None
-
-try:
-    import gmpy2
-
-    HAS_GMPY2 = True
-except ImportError:
-    HAS_GMPY2 = False
 
 
-# ---------------------------------------------------------------------------
-# Shared configuration
-# ---------------------------------------------------------------------------
-BIT_SIZES     = [1_000, 10_000, 100_000, 1_000_000, 10_000_000, 100_000_000,
-                 1_000_000_000, 10_000_000_000]
-
-DIV_BIT_SIZES = [1_000, 10_000, 100_000, 1_000_000, 10_000_000, 100_000_000,
-                 1_000_000_000]
-
-# For pow the exponent must be small; otherwise all backends are impractical.
+BIT_SIZES = [1_000, 10_000, 100_000, 1_000_000, 10_000_000, 100_000_000,
+             1_000_000_000, 10_000_000_000]
+DIV_BIT_SIZES = BIT_SIZES[:-1]
+POW_BASE_BITS = BIT_SIZES[:5]
 POW_EXPONENTS = [2, 3, 10, 20]
-POW_BASE_BITS = [1_000, 10_000, 100_000, 1_000_000, 10_000_000]
-
-_TIMEOUT_S = 10.0  # skip an operation if a single call exceeds this
-
-_COL = 14  # backend column width for the printed tables
+OPERATIONS = ("add", "sub", "mul", "square", "div", "mod", "pow")
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-_GETRANDBITS_MAX = 1 << 29  # random.getrandbits is limited to ~2^31 on most platforms
-
-
-def random_seed(seed: int = 42) -> None:
-    """Seed the RNG so benchmark inputs are reproducible across runs."""
-    random.seed(seed)
-
-
-def random_int(bits: int) -> int:
-    """Return a random positive integer with exactly *bits* bits."""
-    if bits <= 0:
-        return 0
-    if bits <= _GETRANDBITS_MAX:
-        return random.getrandbits(bits) | (1 << (bits - 1))
-    # Build from chunks (MSB first so the shift arithmetic is simple).
-    result = 0
+def random_int(bits, rng):
+    """Generate an exact-width positive integer, including widths > 2**31."""
+    value = 0
     remaining = bits
-    while remaining > 0:
-        n = min(remaining, _GETRANDBITS_MAX)
-        result = (result << n) | random.getrandbits(n)
-        remaining -= n
-    return result | (1 << (bits - 1))
+    while remaining:
+        width = min(remaining, 1 << 29)
+        value = (value << width) | rng.getrandbits(width)
+        remaining -= width
+    return value | (1 << (bits - 1))
 
 
-def gpu_sync() -> None:
-    """Synchronize the default CUDA stream so GPU work is truly finished."""
-    if cp is not None:
-        cp.cuda.Stream.null.synchronize()
+def make_inputs(case, seed):
+    # Seed each case independently: backend ordering, omitted operations and
+    # skipped rows cannot change another backend's input values.
+    op, bits, exponent = case['operation'], case['bits'], case.get('exponent')
+    rng = random.Random(f"tabai:{seed}:{op}:{bits}:{exponent}")
+    a = random_int(bits, rng)
+    if op == 'square':
+        return (a,)
+    if op == 'pow':
+        return a, exponent
+    b = random_int(max(1, bits // 2) if op in ('div', 'mod') else bits, rng)
+    if op == 'sub':
+        a, b = max(a, b), min(a, b)
+        if a == b:
+            if b > 1 << (bits - 1):
+                b -= 1
+            else:
+                a += 1  # bits >= 2; both operands retain the requested width
+    return a, b
 
 
-def bench(
-    fn: Callable[[], object],
-    warmup: int = 2,
-    repeat: int = 5,
-    timeout_s: float = _TIMEOUT_S,
-) -> float | None:
-    """Run *fn* with warm-up, return the **median** elapsed time in seconds.
-
-    Returns *None* if any single call times out or raises an exception
-    (e.g. GPU out-of-memory), so the caller can display a placeholder.
-    """
-    for _ in range(warmup):
-        t0 = time.perf_counter()
-        try:
-            fn()
-        except Exception:
-            return None
-        gpu_sync()
-        if time.perf_counter() - t0 > timeout_s:
-            return None
-    times: list[float] = []
-    for _ in range(repeat):
-        gpu_sync()
-        t0 = time.perf_counter()
-        try:
-            fn()
-        except Exception:
-            return None
-        gpu_sync()
-        t1 = time.perf_counter()
-        elapsed = t1 - t0
-        times.append(elapsed)
-        if elapsed > timeout_s:
-            return None
-    return statistics.median(times)
+def input_digest(values):
+    digest = hashlib.sha256()
+    for value in values:
+        data = value.to_bytes(max(1, (value.bit_length() + 7) // 8), 'little')
+        digest.update(len(data).to_bytes(8, 'little'))
+        digest.update(data)
+    return digest.hexdigest()
 
 
-# ---------------------------------------------------------------------------
-# Wrapper classes – uniform interface for each backend
-# ---------------------------------------------------------------------------
-class _PythonIntBackend:
-    name = "Python int"
-
-    @staticmethod
-    def from_int(n: int) -> int:
-        return n
-
-    @staticmethod
-    def add(a: int, b: int) -> int:
-        return a + b
-
-    @staticmethod
-    def sub(a: int, b: int) -> int:
-        return a - b
-
-    @staticmethod
-    def mul(a: int, b: int) -> int:
-        return a * b
-
-    @staticmethod
-    def floordiv(a: int, b: int) -> int:
-        return a // b
-
-    @staticmethod
-    def mod(a: int, b: int) -> int:
-        return a % b
-
-    @staticmethod
-    def pow(a: int, b: int) -> int:
-        return a ** b
+def square(value):
+    return value * value  # preserve identity for TabaiInt's square path
 
 
-class _Gmpy2Backend:
-    name = "gmpy2.mpz"
-
-    @staticmethod
-    def from_int(n: int) -> "gmpy2.mpz":
-        return gmpy2.mpz(n)
-
-    @staticmethod
-    def add(a: "gmpy2.mpz", b: "gmpy2.mpz") -> "gmpy2.mpz":
-        return a + b
-
-    @staticmethod
-    def sub(a: "gmpy2.mpz", b: "gmpy2.mpz") -> "gmpy2.mpz":
-        return a - b
-
-    @staticmethod
-    def mul(a: "gmpy2.mpz", b: "gmpy2.mpz") -> "gmpy2.mpz":
-        return a * b
-
-    @staticmethod
-    def floordiv(a: "gmpy2.mpz", b: "gmpy2.mpz") -> "gmpy2.mpz":
-        return a // b
-
-    @staticmethod
-    def mod(a: "gmpy2.mpz", b: "gmpy2.mpz") -> "gmpy2.mpz":
-        return a % b
-
-    @staticmethod
-    def pow(a: "gmpy2.mpz", b: "gmpy2.mpz") -> "gmpy2.mpz":
-        return a ** b
+OP_FUNCTIONS = {'add': operator.add, 'sub': operator.sub, 'mul': operator.mul,
+                'div': operator.floordiv, 'mod': operator.mod, 'pow': operator.pow,
+                'square': square}
 
 
-class _TabaiBackend:
-    name = "TabaiInt"
-
-    @staticmethod
-    def from_int(n: int) -> "TabaiInt":
-        return TabaiInt(n)
-
-    @staticmethod
-    def add(a: "TabaiInt", b: "TabaiInt") -> "TabaiInt":
-        return a + b
-
-    @staticmethod
-    def sub(a: "TabaiInt", b: "TabaiInt") -> "TabaiInt":
-        return a - b
-
-    @staticmethod
-    def mul(a: "TabaiInt", b: "TabaiInt") -> "TabaiInt":
-        return a * b
-
-    @staticmethod
-    def floordiv(a: "TabaiInt", b: "TabaiInt") -> "TabaiInt":
-        return a // b
-
-    @staticmethod
-    def mod(a: "TabaiInt", b: "TabaiInt") -> "TabaiInt":
-        return a % b
-
-    @staticmethod
-    def pow(a: "TabaiInt", b: "TabaiInt") -> "TabaiInt":
-        return a ** b
+def calculate(operation, values):
+    return OP_FUNCTIONS[operation](*values)
 
 
-def available_backends() -> list[object]:
-    """Return the backends that can be imported, TabaiInt and gmpy2 first."""
-    backends: list[object] = []
-    if HAS_TABAI:
-        backends.append(_TabaiBackend())
-    if HAS_GMPY2:
-        backends.append(_Gmpy2Backend())
-    backends.append(_PythonIntBackend())
-    return backends
-
-
-# ---------------------------------------------------------------------------
-# Output helpers
-# ---------------------------------------------------------------------------
-def format_time(seconds: float | None) -> str:
-    if seconds is None:
-        return "   >timeout"
+def format_time(seconds):
     if seconds < 1e-3:
-        return f"{seconds * 1e6:>10.1f} us"
-    if seconds < 1.0:
-        return f"{seconds * 1e3:>10.2f} ms"
-    return f"{seconds:>10.3f}  s"
+        return f'{seconds * 1e6:.3f} us'
+    if seconds < 1:
+        return f'{seconds * 1e3:.3f} ms'
+    return f'{seconds:.3f} s'
 
 
-def print_header(backends: list[object]) -> None:
-    names = [b.name for b in backends]
-    header = f"{'Operation':<28} {'bits':>10}"
-    for n in names:
-        header += f" {n:>{_COL}}"
-    print(header)
-    print("-" * len(header))
+class ResultMismatch(Exception):
+    pass
 
 
-def run_op_bench(
-    op_name: str,
-    bits: int,
-    backends: list[object],
-    make_args: Callable,
-    run: Callable,
-    skip_backends: set[str] | None = None,
-    warmup: int = 2,
-    repeat: int = 5,
-    timeout_s: float = _TIMEOUT_S,
-) -> set[str]:
-    """Run one benchmark row. Returns the set of backend names that timed out
-    (or OOM'd) at this bit size so callers can skip them for larger sizes."""
-    row = f"{op_name:<28} {bits:>10}"
-    newly_timed_out: set[str] = set()
-    for backend in backends:
-        if skip_backends and backend.name in skip_backends:
-            row += f" {'--':>{_COL}}"
-            continue
-        args_raw = make_args(bits)
-        args = tuple(backend.from_int(x) for x in args_raw)
-        elapsed = bench(
-            lambda a=args, r=run, be=backend: r(be, *a),
-            warmup=warmup,
-            repeat=repeat,
-            timeout_s=timeout_s,
-        )
-        if elapsed is None:
-            newly_timed_out.add(backend.name)
-        row += f" {format_time(elapsed):>{_COL}}"
-    print(row, flush=True)
-    return newly_timed_out
+def measure(fn, *, sync=lambda: None, verify=None, notify=lambda phase: None,
+            warmup=2, repeat=5, clock=time.perf_counter):
+    if warmup < 0 or repeat < 1:
+        raise ValueError('warmup must be >= 0 and repeat >= 1')
+    samples = []
+    for iteration in range(warmup + repeat):
+        notify('warmup' if iteration < warmup else 'measurement')
+        sync()  # includes completion of input conversion, also before warmup
+        start = clock()
+        result = fn()
+        sync()  # asynchronous CUDA failures propagate to the worker's handler
+        elapsed = clock() - start
+        if verify is not None:
+            notify('verification')
+            verify(result)
+        if iteration >= warmup:
+            samples.append(elapsed)
+        # Release old output BEFORE the next timed allocation, not in result=fn().
+        del result
+    return {'median_seconds': statistics.median(samples), 'samples_seconds': samples}
 
 
-def standalone(run: Callable[[list[object]], None]) -> None:
-    """Run a single benchmark module's ``run`` against the available backends,
-    printing the shared banner first. Used by each ``bench_*.py``'s ``main``."""
-    backends = available_backends()
-    if not backends:
-        print("ERROR: no backends available", file=sys.stderr)
-        sys.exit(1)
-    print(f"Backends: {', '.join(b.name for b in backends)}\n")
-    run(backends)
+class PythonBackend:
+    def context(self):
+        return nullcontext()
+
+    def from_int(self, value):
+        return value
+
+    def to_int(self, value):
+        return int(value)
+
+    def sync(self):
+        pass  # CPU timing must never initialize or synchronize CUDA
+
+    def counters(self):
+        return {'distributed_multiplications': 0, 'copies': {'peer': 0, 'host': 0, 'local': 0}}
+
+    def memory(self):
+        return {}
+
+    def metadata(self):
+        return {}
+
+
+class GmpBackend(PythonBackend):
+    def __init__(self):
+        import gmpy2
+        self.gmpy2 = gmpy2
+
+    def from_int(self, value):
+        return self.gmpy2.mpz(value)
+
+    def metadata(self):
+        return {'gmpy2_version': self.gmpy2.version()}
+
+
+class TabaiBackend(PythonBackend):
+    def __init__(self, spec, config):
+        import cupy as cp
+        from tabai_gpu import TabaiInt, multi_gpu
+        self.cp, self.TabaiInt, self.multi_gpu = cp, TabaiInt, multi_gpu
+        self.devices = spec['devices']
+        self.mode = spec['gpu_mode']
+        self.config = config
+        self.executor = None
+        count = cp.cuda.runtime.getDeviceCount()
+        if any(d < 0 or d >= count for d in self.devices):
+            raise ValueError(f"requested devices {self.devices}; only {count} CUDA device(s) visible")
+
+    @contextmanager
+    def context(self):
+        with self.cp.cuda.Device(self.devices[0]):
+            scope = (self.multi_gpu(self.devices, min_bits=self.config['min_bits'],
+                                    transfer=self.config['transfer'])
+                     if self.mode == 'multi' else nullcontext())
+            with scope as self.executor:
+                yield
+
+    def from_int(self, value):
+        return self.TabaiInt(value)
+
+    def to_int(self, value):
+        return value.to_cpu()
+
+    def sync(self):
+        if self.executor is not None:
+            self.executor.synchronize()
+        self.cp.cuda.get_current_stream().synchronize()
+
+    def counters(self):
+        if self.executor is None:
+            return super().counters()
+        return {'distributed_multiplications': self.executor.multiplications,
+                'copies': {k: getattr(self.executor, f'{k}_copies') for k in ('peer', 'host', 'local')}}
+
+    def memory(self):
+        reserved = {}
+        for device in self.devices:
+            with self.cp.cuda.Device(device):
+                reserved[str(device)] = self.cp.get_default_memory_pool().total_bytes()
+        return reserved
+
+    def metadata(self):
+        hardware = []
+        for device in self.devices:
+            props = self.cp.cuda.runtime.getDeviceProperties(device)
+            name = props['name']
+            hardware.append({'id': device, 'name': name.decode() if isinstance(name, bytes) else name,
+                             'total_memory_bytes': props['totalGlobalMem']})
+        return {'hardware': hardware, 'cupy_version': self.cp.__version__,
+                'cuda_runtime': self.cp.cuda.runtime.runtimeGetVersion(),
+                'cuda_driver': self.cp.cuda.runtime.driverGetVersion(),
+                'peer_access': {f'{dst}<-{src}': bool(self.cp.cuda.runtime.deviceCanAccessPeer(dst, src))
+                                for dst in self.devices for src in self.devices if dst != src}}
+
+
+def create_backend(spec, config):
+    if spec['backend'] == 'python':
+        return PythonBackend()
+    if spec['backend'] == 'gmpy2':
+        return GmpBackend()
+    return TabaiBackend(spec, config)
+
+
+def run_case(backend, case, config, notify):
+    phase = 'preparation'
+    record = dict(case, status='ok')
+
+    def progress(value):
+        nonlocal phase
+        phase = value
+        notify(value)
+
+    try:
+        progress('preparation')
+        raw = make_inputs(case, config['seed'])
+        record['input_sha256'] = input_digest(raw)
+        args = tuple(backend.from_int(v) for v in raw)
+        operation = OP_FUNCTIONS[case['operation']]
+        verify = None
+        if config['verify']:
+            progress('reference')
+            try:
+                oracle = GmpBackend()
+            except ImportError:
+                oracle = PythonBackend()
+            expected = operation(*(oracle.from_int(v) for v in raw))
+
+            def verify(result):
+                if backend.to_int(result) != expected:
+                    raise ResultMismatch('result differs from the CPU integer reference')
+
+        before = backend.counters()
+        record.update(measure(lambda: operation(*args), sync=backend.sync,
+                              verify=verify, notify=progress, warmup=config['warmup'], repeat=config['repeat']))
+        after = backend.counters()
+        progress('reporting')
+        record.update(verified=config['verify'],
+                      distributed_multiplications=after['distributed_multiplications'] - before['distributed_multiplications'],
+                      copies={k: after['copies'][k] - before['copies'][k] for k in after['copies']},
+                      cupy_pool_reserved_bytes=backend.memory())
+    except Exception as error:
+        # GPU OutOfMemoryError subclasses MemoryError. Unexpected exceptions
+        # and incorrect results remain errors instead of being called timeouts.
+        status = 'oom' if isinstance(error, MemoryError) else 'error'
+        if isinstance(error, ResultMismatch):
+            status = 'mismatch'
+        record.update(status=status, phase=phase, error_type=type(error).__name__, error=str(error))
+    return record

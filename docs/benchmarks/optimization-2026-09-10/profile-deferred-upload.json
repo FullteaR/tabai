@@ -1,0 +1,70 @@
+[
+  {
+    "mode": "single",
+    "operation": "mul",
+    "bits": 100000000,
+    "wall_median_ms": 20.51743201445788,
+    "gpu_event_ms_per_operation": {
+      "device0:_ntt_forward": 10.92545280456543,
+      "device0:_ntt_inverse": 5.535744094848633,
+      "device0:_resolve_carries": 2.3334911823272706,
+      "device0:_recombine_chunks": 0.19804159700870516,
+      "device0:_trim_z": 0.2435519993305206
+    },
+    "copy_wall_ms_per_operation": 0.0,
+    "copy_bytes_per_operation": 0.0,
+    "note": "Instrumented warm-cache run; GPU events on different devices overlap and must not be summed as wall time."
+  },
+  {
+    "mode": "single",
+    "operation": "square",
+    "bits": 100000000,
+    "wall_median_ms": 14.643202011939138,
+    "gpu_event_ms_per_operation": {
+      "device0:_ntt_forward": 5.424684715270997,
+      "device0:_ntt_inverse": 5.504851245880127,
+      "device0:_resolve_carries": 2.3095295429229736,
+      "device0:_recombine_chunks": 0.19763199985027313,
+      "device0:_trim_z": 0.24478080272674563
+    },
+    "copy_wall_ms_per_operation": 0.0,
+    "copy_bytes_per_operation": 0.0,
+    "note": "Instrumented warm-cache run; GPU events on different devices overlap and must not be summed as wall time."
+  },
+  {
+    "mode": "multi",
+    "operation": "mul",
+    "bits": 100000000,
+    "wall_median_ms": 24.156986008165404,
+    "gpu_event_ms_per_operation": {
+      "device0:_ntt_forward": 4.530995273590088,
+      "device1:_ntt_forward": 4.578092861175537,
+      "device0:_ntt_inverse": 2.2652928829193115,
+      "device1:_ntt_inverse": 2.3041983127593992,
+      "device0:_resolve_carries": 1.7169152021408083,
+      "device0:_recombine_chunks": 0.14745600521564484,
+      "device0:_trim_z": 0.1514495998620987
+    },
+    "copy_wall_ms_per_operation": 7.970318209845573,
+    "copy_bytes_per_operation": 117108864.0,
+    "note": "Instrumented warm-cache run; GPU events on different devices overlap and must not be summed as wall time."
+  },
+  {
+    "mode": "multi",
+    "operation": "square",
+    "bits": 100000000,
+    "wall_median_ms": 20.181579020572826,
+    "gpu_event_ms_per_operation": {
+      "device0:_ntt_forward": 2.2677504539489743,
+      "device1:_ntt_forward": 2.2710848331451414,
+      "device0:_ntt_inverse": 2.2682048797607424,
+      "device1:_ntt_inverse": 2.2837247371673586,
+      "device0:_resolve_carries": 1.715398406982422,
+      "device0:_recombine_chunks": 0.14807040095329285,
+      "device0:_trim_z": 0.14547840058803557
+    },
+    "copy_wall_ms_per_operation": 6.037534400820732,
+    "copy_bytes_per_operation": 92108864.0,
+    "note": "Instrumented warm-cache run; GPU events on different devices overlap and must not be summed as wall time."
+  }
+]

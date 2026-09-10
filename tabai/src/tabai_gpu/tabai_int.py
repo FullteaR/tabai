@@ -5,8 +5,17 @@ import cupy as cp
 from .core import GPUBigInt
 from .utils import int_to_gpu, gpu_to_int
 
-_shared_gpu_big_int = GPUBigInt()
-_ONE = cp.array([1], dtype=cp.uint32)
+# Scratch and scalar constants must belong to the active device and stream.
+# Lazy creation also avoids binding the whole module to the import-time GPU.
+_engines: dict[tuple[int, int], GPUBigInt] = {}
+
+
+def _get_engine() -> GPUBigInt:
+    key = (cp.cuda.runtime.getDevice(), cp.cuda.get_current_stream().ptr)
+    engine = _engines.get(key)
+    if engine is None:
+        engine = _engines[key] = GPUBigInt()
+    return engine
 
 
 def _arr_is_zero(gpu: cp.ndarray) -> bool:
@@ -24,7 +33,7 @@ def _mag_cmp(a_gpu: cp.ndarray, b_gpu: cp.ndarray) -> int:
     la, lb = len(a_gpu), len(b_gpu)
     if la != lb:
         return 1 if la > lb else -1
-    return _shared_gpu_big_int._compare(a_gpu, b_gpu)
+    return _get_engine()._compare(a_gpu, b_gpu)
 
 
 class TabaiInt:
@@ -36,7 +45,7 @@ class TabaiInt:
                 self._zero = _zero            # None => compute lazily on demand
             else:
                 # Trimming already yields zero-ness for free.
-                self._gpu, self._zero = _shared_gpu_big_int._trim_z(value)
+                self._gpu, self._zero = _get_engine()._trim_z(value)
             self._sign = sign
         else:
             self._sign = -1 if value < 0 else 1
@@ -84,15 +93,15 @@ class TabaiInt:
         if other is NotImplemented:
             return NotImplemented
         if self._sign == other._sign:
-            result, z = _shared_gpu_big_int.add_trimmed(self._gpu, other._gpu)
+            result, z = _get_engine().add_trimmed(self._gpu, other._gpu)
             return TabaiInt(result, self._sign, _trimmed=True, _zero=z)
         cmp = _mag_cmp(self._gpu, other._gpu)
         if cmp == 0:
             return TabaiInt(0)
         if cmp > 0:
-            result, z = _shared_gpu_big_int.sub_trimmed(self._gpu, other._gpu)
+            result, z = _get_engine().sub_trimmed(self._gpu, other._gpu)
             return TabaiInt(result, self._sign, _trimmed=True, _zero=z)
-        result, z = _shared_gpu_big_int.sub_trimmed(other._gpu, self._gpu)
+        result, z = _get_engine().sub_trimmed(other._gpu, self._gpu)
         return TabaiInt(result, other._sign, _trimmed=True, _zero=z)
 
     def __sub__(self, other: TabaiInt | int) -> TabaiInt:
@@ -101,15 +110,15 @@ class TabaiInt:
             return NotImplemented
         # Equivalent to self + (-other), but inlined so other._gpu is not copied.
         if self._sign != other._sign:
-            result, z = _shared_gpu_big_int.add_trimmed(self._gpu, other._gpu)
+            result, z = _get_engine().add_trimmed(self._gpu, other._gpu)
             return TabaiInt(result, self._sign, _trimmed=True, _zero=z)
         cmp = _mag_cmp(self._gpu, other._gpu)
         if cmp == 0:
             return TabaiInt(0)
         if cmp > 0:
-            result, z = _shared_gpu_big_int.sub_trimmed(self._gpu, other._gpu)
+            result, z = _get_engine().sub_trimmed(self._gpu, other._gpu)
             return TabaiInt(result, self._sign, _trimmed=True, _zero=z)
-        result, z = _shared_gpu_big_int.sub_trimmed(other._gpu, self._gpu)
+        result, z = _get_engine().sub_trimmed(other._gpu, self._gpu)
         return TabaiInt(result, -other._sign, _trimmed=True, _zero=z)
 
     def __mul__(self, other: TabaiInt | int) -> TabaiInt:
@@ -118,7 +127,7 @@ class TabaiInt:
             return NotImplemented
         if self._is_zero() or other._is_zero():
             return TabaiInt(0)
-        result = _shared_gpu_big_int.mul(self._gpu, other._gpu)
+        result = _get_engine().mul(self._gpu, other._gpu)
         return TabaiInt(result, self._sign * other._sign)
 
     def __floordiv__(self, other: TabaiInt | int) -> TabaiInt:
@@ -139,7 +148,7 @@ class TabaiInt:
         other = self._coerce(other)
         if other is NotImplemented:
             return NotImplemented
-        q_gpu, r_gpu = _shared_gpu_big_int.divmod(self._gpu, other._gpu)
+        q_gpu, r_gpu = _get_engine().divmod(self._gpu, other._gpu)
         # q_gpu, r_gpu are trimmed magnitudes from the engine.
         if _arr_is_zero(r_gpu):
             q_zero = _arr_is_zero(q_gpu)
@@ -150,8 +159,8 @@ class TabaiInt:
             # leave q's zero flag lazy rather than asserting it.
             return (TabaiInt(q_gpu, 1, _trimmed=True),
                     TabaiInt(r_gpu, self._sign, _trimmed=True, _zero=False))
-        q_adj = _shared_gpu_big_int.add(q_gpu, _ONE)
-        r_adj = _shared_gpu_big_int.sub(other._gpu, r_gpu)
+        q_adj = _get_engine().add(q_gpu, _get_engine()._one)
+        r_adj = _get_engine().sub(other._gpu, r_gpu)
         return TabaiInt(q_adj, -1), TabaiInt(r_adj, other._sign)
 
     def __radd__(self, other: int) -> TabaiInt:
@@ -195,7 +204,7 @@ class TabaiInt:
             return TabaiInt(1)
         if exp == 1:
             return TabaiInt(self._gpu, self._sign, _trimmed=True, _zero=self._zero)
-        calc = _shared_gpu_big_int
+        calc = _get_engine()
         base_gpu = self._gpu
         n_bits = exp.bit_length()
 

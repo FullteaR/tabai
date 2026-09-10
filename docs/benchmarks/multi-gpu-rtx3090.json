@@ -1,0 +1,475 @@
+{
+  "config": {
+    "devices": [
+      0,
+      1
+    ],
+    "bits": [
+      1000000,
+      10000000,
+      100000000
+    ],
+    "operations": [
+      "mul",
+      "square",
+      "pow",
+      "div"
+    ],
+    "warmup": 2,
+    "repeat": 5,
+    "min_bits": 64000000,
+    "transfer": "auto"
+  },
+  "reports": [
+    {
+      "mode": "single",
+      "rows": [
+        {
+          "bits": 1000000,
+          "operation": "mul",
+          "median_seconds": 0.0002562600000146631,
+          "samples_seconds": [
+            0.00025888599998324935,
+            0.0002562600000146631,
+            0.00025141899982372706,
+            0.00025324899979750626,
+            0.00025649600001997896
+          ],
+          "cupy_pool_reserved_bytes": {
+            "0": 6672896
+          },
+          "distributed_multiplications": 0
+        },
+        {
+          "bits": 1000000,
+          "operation": "square",
+          "median_seconds": 0.00020046999998157844,
+          "samples_seconds": [
+            0.00020404299993970199,
+            0.00020773900018866698,
+            0.0001988839999285119,
+            0.00020046999998157844,
+            0.00019530400004441617
+          ],
+          "cupy_pool_reserved_bytes": {
+            "0": 6935552
+          },
+          "distributed_multiplications": 0
+        },
+        {
+          "bits": 1000000,
+          "operation": "pow",
+          "median_seconds": 0.0005463390000386426,
+          "samples_seconds": [
+            0.0005528520000552817,
+            0.0005463390000386426,
+            0.0005496669998592552,
+            0.000544091000165281,
+            0.0005456449998746393
+          ],
+          "cupy_pool_reserved_bytes": {
+            "0": 17422336
+          },
+          "distributed_multiplications": 0
+        },
+        {
+          "bits": 1000000,
+          "operation": "div",
+          "median_seconds": 0.004062870000097973,
+          "samples_seconds": [
+            0.00406460999988667,
+            0.004058294000060414,
+            0.00405798900010268,
+            0.004062870000097973,
+            0.004093162999879496
+          ],
+          "cupy_pool_reserved_bytes": {
+            "0": 17422336
+          },
+          "distributed_multiplications": 0
+        },
+        {
+          "bits": 10000000,
+          "operation": "mul",
+          "median_seconds": 0.0037100930001088273,
+          "samples_seconds": [
+            0.0037100930001088273,
+            0.0037093189998813614,
+            0.0037229929998829903,
+            0.003729181000153403,
+            0.003709677999950145
+          ],
+          "cupy_pool_reserved_bytes": {
+            "0": 120588800
+          },
+          "distributed_multiplications": 0
+        },
+        {
+          "bits": 10000000,
+          "operation": "square",
+          "median_seconds": 0.0026123850000203674,
+          "samples_seconds": [
+            0.0026131859999622975,
+            0.0026100619998032926,
+            0.0026123850000203674,
+            0.002612386000009792,
+            0.0026049609998608503
+          ],
+          "cupy_pool_reserved_bytes": {
+            "0": 120588800
+          },
+          "distributed_multiplications": 0
+        },
+        {
+          "bits": 10000000,
+          "operation": "pow",
+          "median_seconds": 0.006349912999894514,
+          "samples_seconds": [
+            0.0063815870000780706,
+            0.006354810000175348,
+            0.006343411999978343,
+            0.006349912999894514,
+            0.006345077000105448
+          ],
+          "cupy_pool_reserved_bytes": {
+            "0": 124783616
+          },
+          "distributed_multiplications": 0
+        },
+        {
+          "bits": 10000000,
+          "operation": "div",
+          "median_seconds": 0.020467394999968747,
+          "samples_seconds": [
+            0.020973854000203573,
+            0.020596062000095117,
+            0.020467394999968747,
+            0.020408387000088624,
+            0.020337939000000915
+          ],
+          "cupy_pool_reserved_bytes": {
+            "0": 134424576
+          },
+          "distributed_multiplications": 0
+        },
+        {
+          "bits": 100000000,
+          "operation": "mul",
+          "median_seconds": 0.03623601599997528,
+          "samples_seconds": [
+            0.03625929999998334,
+            0.03625491200000397,
+            0.03616792399998303,
+            0.036220167000010406,
+            0.03623601599997528
+          ],
+          "cupy_pool_reserved_bytes": {
+            "0": 964734464
+          },
+          "distributed_multiplications": 0
+        },
+        {
+          "bits": 100000000,
+          "operation": "square",
+          "median_seconds": 0.025118495000015173,
+          "samples_seconds": [
+            0.025136730000212992,
+            0.025141695000002073,
+            0.025118495000015173,
+            0.025099027000123897,
+            0.025108775000035166
+          ],
+          "cupy_pool_reserved_bytes": {
+            "0": 964734464
+          },
+          "distributed_multiplications": 0
+        },
+        {
+          "bits": 100000000,
+          "operation": "pow",
+          "median_seconds": 0.10481093799990049,
+          "samples_seconds": [
+            0.10489719800011699,
+            0.10466820800002097,
+            0.10488428100006786,
+            0.10477565799988042,
+            0.10481093799990049
+          ],
+          "cupy_pool_reserved_bytes": {
+            "0": 2306912768
+          },
+          "distributed_multiplications": 0
+        },
+        {
+          "bits": 100000000,
+          "operation": "div",
+          "median_seconds": 0.23811984799999664,
+          "samples_seconds": [
+            0.23802930700003344,
+            0.23811984799999664,
+            0.23811576800017065,
+            0.23812741100005042,
+            0.23814196399985121
+          ],
+          "cupy_pool_reserved_bytes": {
+            "0": 2306912768
+          },
+          "distributed_multiplications": 0
+        }
+      ],
+      "copies": {},
+      "hardware": [
+        {
+          "id": 0,
+          "name": "NVIDIA GeForce RTX 3090",
+          "total_memory_bytes": 25296044032
+        },
+        {
+          "id": 1,
+          "name": "NVIDIA GeForce RTX 3090",
+          "total_memory_bytes": 25296044032
+        }
+      ],
+      "cupy_version": "14.0.1",
+      "cuda_runtime": 13000,
+      "cuda_driver": 13000,
+      "peer_access": {
+        "0<-1": false,
+        "1<-0": false
+      }
+    },
+    {
+      "mode": "distributed",
+      "rows": [
+        {
+          "bits": 1000000,
+          "operation": "mul",
+          "median_seconds": 0.0002512319999823376,
+          "samples_seconds": [
+            0.0002518369999506831,
+            0.00024111199991239118,
+            0.00025644600009400165,
+            0.0002512319999823376,
+            0.00023898199992800073
+          ],
+          "cupy_pool_reserved_bytes": {
+            "0": 6674944,
+            "1": 2048
+          },
+          "distributed_multiplications": 0
+        },
+        {
+          "bits": 1000000,
+          "operation": "square",
+          "median_seconds": 0.00018048800006909005,
+          "samples_seconds": [
+            0.00017972299997381924,
+            0.00019454600010249123,
+            0.00018048800006909005,
+            0.00019503699991219037,
+            0.00017527399995742599
+          ],
+          "cupy_pool_reserved_bytes": {
+            "0": 6937600,
+            "1": 2048
+          },
+          "distributed_multiplications": 0
+        },
+        {
+          "bits": 1000000,
+          "operation": "pow",
+          "median_seconds": 0.0005047899999226502,
+          "samples_seconds": [
+            0.0005047899999226502,
+            0.0005011420000755606,
+            0.0004914589999316377,
+            0.0005138829999395966,
+            0.0005120020000504155
+          ],
+          "cupy_pool_reserved_bytes": {
+            "0": 17424384,
+            "1": 2048
+          },
+          "distributed_multiplications": 0
+        },
+        {
+          "bits": 1000000,
+          "operation": "div",
+          "median_seconds": 0.0037448190000759496,
+          "samples_seconds": [
+            0.0037515750000238768,
+            0.0037448190000759496,
+            0.00373472500018579,
+            0.003731043000016143,
+            0.0037526749999869935
+          ],
+          "cupy_pool_reserved_bytes": {
+            "0": 17424384,
+            "1": 2048
+          },
+          "distributed_multiplications": 0
+        },
+        {
+          "bits": 10000000,
+          "operation": "mul",
+          "median_seconds": 0.003686801000185369,
+          "samples_seconds": [
+            0.003686801000185369,
+            0.003693245000022216,
+            0.0036854080001376133,
+            0.0036855769999419863,
+            0.003729155999963041
+          ],
+          "cupy_pool_reserved_bytes": {
+            "0": 120590848,
+            "1": 2048
+          },
+          "distributed_multiplications": 0
+        },
+        {
+          "bits": 10000000,
+          "operation": "square",
+          "median_seconds": 0.0026026330001513998,
+          "samples_seconds": [
+            0.0026199789999736822,
+            0.002604754000003595,
+            0.002601004000098328,
+            0.0025908029999754945,
+            0.0026026330001513998
+          ],
+          "cupy_pool_reserved_bytes": {
+            "0": 120590848,
+            "1": 2048
+          },
+          "distributed_multiplications": 0
+        },
+        {
+          "bits": 10000000,
+          "operation": "pow",
+          "median_seconds": 0.006304444000079457,
+          "samples_seconds": [
+            0.006315484000197102,
+            0.00630024199995205,
+            0.006314631000122972,
+            0.006294104000062362,
+            0.006304444000079457
+          ],
+          "cupy_pool_reserved_bytes": {
+            "0": 124785664,
+            "1": 2048
+          },
+          "distributed_multiplications": 0
+        },
+        {
+          "bits": 10000000,
+          "operation": "div",
+          "median_seconds": 0.02041834600004222,
+          "samples_seconds": [
+            0.020383949000006396,
+            0.020383694999964064,
+            0.020437304000097356,
+            0.020452153999940492,
+            0.02041834600004222
+          ],
+          "cupy_pool_reserved_bytes": {
+            "0": 134426624,
+            "1": 2048
+          },
+          "distributed_multiplications": 0
+        },
+        {
+          "bits": 100000000,
+          "operation": "mul",
+          "median_seconds": 0.03139346700004353,
+          "samples_seconds": [
+            0.03135932700001831,
+            0.03139346700004353,
+            0.031410005999987334,
+            0.03138029199999437,
+            0.03141484399998262
+          ],
+          "cupy_pool_reserved_bytes": {
+            "0": 794973696,
+            "1": 335546368
+          },
+          "distributed_multiplications": 7
+        },
+        {
+          "bits": 100000000,
+          "operation": "square",
+          "median_seconds": 0.0251999380000143,
+          "samples_seconds": [
+            0.025120009999909598,
+            0.02521933700018053,
+            0.025266186000180824,
+            0.0251999380000143,
+            0.02516084800004137
+          ],
+          "cupy_pool_reserved_bytes": {
+            "0": 794973696,
+            "1": 335546368
+          },
+          "distributed_multiplications": 7
+        },
+        {
+          "bits": 100000000,
+          "operation": "pow",
+          "median_seconds": 0.08875371799990717,
+          "samples_seconds": [
+            0.08900716799985275,
+            0.08875371799990717,
+            0.08877485199991497,
+            0.08859697399998367,
+            0.08871988099986083
+          ],
+          "cupy_pool_reserved_bytes": {
+            "0": 1631844864,
+            "1": 872417280
+          },
+          "distributed_multiplications": 14
+        },
+        {
+          "bits": 100000000,
+          "operation": "div",
+          "median_seconds": 0.2275412960000267,
+          "samples_seconds": [
+            0.22774862999995094,
+            0.22740948000000571,
+            0.22768462899989572,
+            0.22746613300000718,
+            0.2275412960000267
+          ],
+          "cupy_pool_reserved_bytes": {
+            "0": 1833171456,
+            "1": 872417280
+          },
+          "distributed_multiplications": 28
+        }
+      ],
+      "copies": {
+        "peer": 0,
+        "host": 168,
+        "local": 98
+      },
+      "hardware": [
+        {
+          "id": 0,
+          "name": "NVIDIA GeForce RTX 3090",
+          "total_memory_bytes": 25296044032
+        },
+        {
+          "id": 1,
+          "name": "NVIDIA GeForce RTX 3090",
+          "total_memory_bytes": 25296044032
+        }
+      ],
+      "cupy_version": "14.0.1",
+      "cuda_runtime": 13000,
+      "cuda_driver": 13000,
+      "peer_access": {
+        "0<-1": false,
+        "1<-0": false
+      }
+    }
+  ]
+}

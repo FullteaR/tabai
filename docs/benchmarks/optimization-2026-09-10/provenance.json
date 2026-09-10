@@ -1,0 +1,41 @@
+{
+  "environment_reference": "../rtx3090-2026-09-10-environment.json",
+  "source_note": "Before is the pre-optimization uncommitted working tree, matching the earlier scaling run; after is the optimized working tree.",
+  "before_source_sha256": {
+    "tabai/src/tabai_gpu/__init__.py": "53628e09de72d182e36b07ff54e4af843de2adc57bc845d2168d22defa55f3a2",
+    "tabai/src/tabai_gpu/core.py": "b7bce0318a15e3adac8a8870827a6176302553f2c519c6f298843734f57335ae",
+    "tabai/src/tabai_gpu/multi_gpu.py": "475ddd51ecea8fc9d6567c557e0b71cf3091572fa0e6d17b18972c7e4a2528b6",
+    "tabai/src/tabai_gpu/tabai_int.py": "37ff9e24b55cc5bd3d058bf8fe7a57c465e1287b2e5924910eaca00adf64c380",
+    "tabai/src/tabai_gpu/utils.py": "b12d767f76396d1eb393c5ca439e28dc0f3cddd29acaf6d65210ec13f421723a"
+  },
+  "after_source_sha256": {
+    "tabai/src/tabai_gpu/__init__.py": "53628e09de72d182e36b07ff54e4af843de2adc57bc845d2168d22defa55f3a2",
+    "tabai/src/tabai_gpu/core.py": "372a43a0ecb2f970eec4ba848a55752ccfe4854a394267c1d9829613e63458d5",
+    "tabai/src/tabai_gpu/multi_gpu.py": "92e39fd03170f38794f0855b6542dad496d2734e5de4c1a26b07b26b3db4d19d",
+    "tabai/src/tabai_gpu/tabai_int.py": "37ff9e24b55cc5bd3d058bf8fe7a57c465e1287b2e5924910eaca00adf64c380",
+    "tabai/src/tabai_gpu/utils.py": "b12d767f76396d1eb393c5ca439e28dc0f3cddd29acaf6d65210ec13f421723a"
+  },
+  "benchmark_source_sha256": {
+    "tabai/benchmarks/__init__.py": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+    "tabai/benchmarks/bench_add.py": "a229ef6e1aea1e19975d1daa89dbf8c729e61a3f226751faede18b943ff220d8",
+    "tabai/benchmarks/bench_div.py": "959bb18520d61e8d96779fc3b28c6bcf2ba620f142749ddcb0a49a1097797bb2",
+    "tabai/benchmarks/bench_mul.py": "0ddd9b02d674b66b293abea9605fcaa4985be82b7fe59507b175b97826f1f3d9",
+    "tabai/benchmarks/bench_multi_gpu.py": "8423a5c6c17027ea056484ac909906b7ee85aa3fa33b37e5b2e218a8a31f7350",
+    "tabai/benchmarks/bench_pow.py": "b49d7aab152b7c1139eb274085e94e05266f26d773a0d0b46c33851b05ecf7e0",
+    "tabai/benchmarks/bench_sub.py": "63c2ddeb134ecd23c316908900f214a6b92447dd6ab3517c8f4b7b144308459f",
+    "tabai/benchmarks/benchmark.py": "3ceee65f72c00b80ab0c0563db99a4b31a839455455fcce224d7b472914fc566",
+    "tabai/benchmarks/common.py": "833af5646c6005b8a830c643451c13ea7208c0b1b8083b0e6d328fe63584f55c",
+    "tabai/benchmarks/runner.py": "e9fa031d9e202d6478f033d169003daeab1fc4fb342d9931f879ef8436746342"
+  },
+  "validation": {
+    "cases": 48,
+    "measured_trials": 336,
+    "warmup_trials": 96
+  },
+  "pytest": {
+    "passed": 648,
+    "skipped": 2,
+    "seconds": 68.11,
+    "require_multi_gpu": true
+  }
+}
